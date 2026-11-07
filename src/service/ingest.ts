@@ -47,7 +47,7 @@ import { tx, type Db, type Queryable } from '../store/db.ts';
 import { accept, markProcessed } from '../store/inbox.ts';
 import { recordReport, recordTelemetry } from '../store/channels.ts';
 import { rows } from '../store/db.ts';
-import { wake } from '../store/devices.ts';
+import { isManaged, wake } from '../store/devices.ts';
 import { log, type Instruments } from '../telemetry.ts';
 
 export type IngestConfig = Readonly<{ webhookSecret: string; signatureTolerance: Duration }>;
@@ -116,6 +116,31 @@ export async function handleWebhook(
       receivedAt: now,
     });
     if (!fresh) return false;
+
+    /*
+     * A signed event for a device we do not manage is recorded and then left
+     * alone. Found by test/integration/ingest.test.ts, where it was a 500.
+     *
+     * `observation` and `command_report` both reference `device`, so applying an
+     * event for an unknown device raises a foreign-key violation, which rolls
+     * the transaction back and answers 500. That is the worst possible reply
+     * here: the platform delivers at least once, so a 5xx teaches it to retry
+     * forever, and this reconciler's own reasoning for answering 2xx to a
+     * duplicate applies with more force to an event that can NEVER succeed.
+     * One misconfigured device would have become permanent load on both sides.
+     *
+     * It is not dropped silently either. The row stays in the inbox with
+     * `processed_at` null, which is exactly the right record: something is
+     * posting us signed events for a device the platform never listed, and that
+     * is a misconfiguration somebody needs to see. The fleet is discovered from
+     * the platform and nowhere else — letting a webhook register a device would
+     * mean whoever can reach this endpoint can add to the fleet.
+     */
+    if (!(await isManaged(client, event.deviceId))) {
+      log('ingest.unknown-device', { eventId: event.eventId, deviceId: event.deviceId });
+      return true;
+    }
+
     if (event.kind === 'report') await applyReport(client, event, now);
     else await applyTelemetry(client, event, now);
     await markProcessed(client, event.eventId, now);

@@ -38,7 +38,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { rows } from '../../src/store/db.ts';
+import { rows, type Db } from '../../src/store/db.ts';
 import { startStack, until, CLIENT_ID, CLIENT_SECRET, WEBHOOK_SECRET, SEED } from './_stack.ts';
 
 type OutboxRow = { command_id: string; device_id: string; generation: string; dispatched_at: string | null };
@@ -68,31 +68,114 @@ const env = (databaseUrl: string, platformUrl: string, port: number): NodeJS.Pro
   LEASE_MS: '2000',
 });
 
-function startReconciler(databaseUrl: string, platformUrl: string, port: number): ChildProcess {
+/**
+ * The child's output is captured, not discarded, and kept in a ring the failure
+ * message can quote.
+ *
+ * Piped rather than inherited for a specific reason: a child whose stdout nobody
+ * reads eventually blocks on a full pipe, and a reconciler blocked on a write to
+ * stdout looks exactly like a reconciler that has hung. Draining is mandatory.
+ * Keeping the last lines is what turns "timed out waiting for a command" — which
+ * says nothing — into the child's own startup error.
+ */
+function startReconciler(databaseUrl: string, platformUrl: string, port: number): Reconciler {
   const child = spawn(process.execPath, ['src/app.ts'], {
     cwd: new URL('../..', import.meta.url).pathname,
     env: env(databaseUrl, platformUrl, port),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  // Piped rather than inherited, and drained: a child whose stdout nobody reads
-  // blocks on a full pipe, which looks exactly like a hung reconciler.
-  child.stdout?.resume();
-  child.stderr?.resume();
-  return child;
+  const lines: string[] = [];
+  const keep = (chunk: Buffer): void => {
+    lines.push(chunk.toString());
+    if (lines.length > 60) lines.shift();
+  };
+  child.stdout?.on('data', keep);
+  child.stderr?.on('data', keep);
+  return { child, output: () => lines.join('') };
 }
 
-async function kill(child: ChildProcess): Promise<void> {
+type Reconciler = Readonly<{ child: ChildProcess; output: () => string }>;
+
+/**
+ * Make every known device want to be charging.
+ *
+ * The second thing this test got wrong, and again by blinding itself rather
+ * than by finding a bug. `device.intent_charging` defaults to false and most of
+ * the simulated fleet starts PLUGGED_IN:STOPPED — so every device already
+ * matched its intent, the loop correctly issued nothing, and the test waited
+ * thirty seconds for a command that had no reason to exist. A reconciler with
+ * nothing to reconcile is not a broken reconciler.
+ *
+ * Driven through the reconciler's own HTTP API rather than by writing the column
+ * directly, because that is the path a real caller takes: it also pulls
+ * `wake_at` forward, which is what makes an intent change act in seconds
+ * instead of at the next sweep.
+ */
+async function wantCharging(port: number, db: Db): Promise<string[]> {
+  const devices = await until(
+    'the fleet to be registered',
+    () => rows<{ device_id: string }>(db, `select device_id from device order by device_id`),
+    (r) => r.length > 0,
+  );
+  for (const { device_id: deviceId } of devices) {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/devices/${deviceId}/intent`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ charging: true, source: 'operator' }),
+    });
+    assert.equal(res.status, 200, `setting intent on ${deviceId}`);
+  }
+  return devices.map((d) => d.device_id);
+}
+
+/**
+ * `until`, with the child's own log attached to the failure.
+ *
+ * Worth the wrapper: every wait in this file is on something the reconciler is
+ * supposed to do, so when one times out the only question is what the
+ * reconciler was doing instead — and the answer is always in its output.
+ */
+async function untilOrExplain<T>(
+  r: Reconciler,
+  what: string,
+  probe: () => Promise<T>,
+  ok: (value: T) => boolean,
+  timeoutMs = 30_000,
+): Promise<T> {
+  try {
+    return await until(what, probe, ok, timeoutMs);
+  } catch (cause) {
+    throw new Error(`${String(cause)}\nreconciler output:\n${r.output()}`, { cause });
+  }
+}
+
+async function kill(r: Reconciler): Promise<void> {
+  const { child } = r;
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill('SIGKILL');
   await once(child, 'exit');
 }
 
 test('a SIGKILL mid-flight does not produce a second actuation', async (t) => {
-  const stack = await startStack({ fleetSize: 3, tickMs: 250 });
+  /*
+   * The platform must be told where to deliver, BEFORE the reconciler starts.
+   *
+   * The first version of this test left `webhookUrl` empty and then waited for a
+   * command that never came — because the reconciler was behaving correctly. No
+   * webhooks means no telemetry, a device with no telemetry row is modelled as
+   * UNREACHABLE, and the decision function refuses to issue a command into a
+   * feed it cannot verify ("no telemetry; refusing to issue blind"). The test
+   * was asserting on a loop it had blinded.
+   */
   const port = 19_910;
-  let child = startReconciler(stack.databaseUrl, stack.platform.url, port);
+  const stack = await startStack({
+    fleetSize: 3,
+    tickMs: 250,
+    webhookUrl: `http://127.0.0.1:${port}/webhooks`,
+  });
+  let reconciler = startReconciler(stack.databaseUrl, stack.platform.url, port);
   t.after(async () => {
-    await kill(child);
+    await kill(reconciler);
     await stack.stop();
   });
 
@@ -105,7 +188,10 @@ test('a SIGKILL mid-flight does not produce a second actuation', async (t) => {
    * them. Neither ordering is safe, because two systems cannot be updated
    * atomically, which is why there is a third thing.
    */
-  const first = await until(
+  await wantCharging(port, stack.db);
+
+  const first = await untilOrExplain(
+    reconciler,
     'a command in the outbox',
     () =>
       rows<OutboxRow>(
@@ -116,7 +202,7 @@ test('a SIGKILL mid-flight does not produce a second actuation', async (t) => {
   );
   const { command_id: commandId, device_id: deviceId } = first[0]!;
 
-  await kill(child);
+  await kill(reconciler);
 
   // The phase must still be ISSUED, with its deadline, after the process that
   // created it is gone. In the sibling repository this is where the state was.
@@ -133,7 +219,7 @@ test('a SIGKILL mid-flight does not produce a second actuation', async (t) => {
 
   const beforeRestart = stack.platform.stats();
 
-  child = startReconciler(stack.databaseUrl, stack.platform.url, port);
+  reconciler = startReconciler(stack.databaseUrl, stack.platform.url, port);
 
   /*
    * Now the real question. The restarted process re-drives the outbox, and it
@@ -207,26 +293,32 @@ test('the durable timer still times out a command issued by a process that died'
    * platform is pointed at a device that acknowledges and never applies, which
    * is what makes the timeout the only possible outcome.
    */
-  const stack = await startStack({ fleetSize: 3, tickMs: 250 });
   const port = 19_911;
-  let child = startReconciler(stack.databaseUrl, stack.platform.url, port);
+  const stack = await startStack({
+    fleetSize: 3,
+    tickMs: 250,
+    webhookUrl: `http://127.0.0.1:${port}/webhooks`,
+  });
+  let reconciler = startReconciler(stack.databaseUrl, stack.platform.url, port);
   t.after(async () => {
-    await kill(child);
+    await kill(reconciler);
     await stack.stop();
   });
 
-  await until(
+  await wantCharging(port, stack.db);
+  await untilOrExplain(
+    reconciler,
     'a command in the outbox',
     () => rows<OutboxRow>(stack.db, `select command_id, device_id, generation, dispatched_at from outbox`),
     (r) => r.length >= 1,
   );
-  await kill(child);
+  await kill(reconciler);
 
   // Stay down past the command timeout, so every deadline in flight expires
   // while nothing is running to notice.
   await new Promise((r) => setTimeout(r, 9_000));
 
-  child = startReconciler(stack.databaseUrl, stack.platform.url, port);
+  reconciler = startReconciler(stack.databaseUrl, stack.platform.url, port);
 
   const settled = await until(
     'every device to leave ISSUED after the restart',

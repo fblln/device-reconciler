@@ -400,3 +400,19 @@ export async function viewRows(q: Queryable, now: Instant): Promise<DeviceViewRo
 export async function setOptimistic(q: Queryable, deviceId: string, optimistic: boolean): Promise<void> {
   await q.query(`update device set optimistic = $2 where device_id = $1`, [deviceId, optimistic]);
 }
+
+/**
+ * Do we manage this device?
+ *
+ * Needed because `observation` and `command_report` reference `device`, so an
+ * event for an unknown device is a foreign-key violation rather than a no-op.
+ * Checking first turns that into an ordinary branch the ingest handler can
+ * answer 2xx to — see the note at its call site for why a 5xx there is the
+ * worst available answer.
+ */
+export async function isManaged(q: Queryable, deviceId: string): Promise<boolean> {
+  const found = await rows<{ device_id: string }>(q, `select device_id from device where device_id = $1`, [
+    deviceId,
+  ]);
+  return found.length === 1;
+}

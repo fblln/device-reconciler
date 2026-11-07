@@ -68,31 +68,31 @@ function generationOf(phase: Phase, fallback: number): number {
   return fallback;
 }
 
-export function createProjector(store: TwinStore): Projector {
-  /*
-   * Every failure is logged and swallowed, which is a deliberate choice and the
-   * reason it is concentrated here rather than left to callers.
-   *
-   * These writes publish CURRENT STATE, not events: idempotent, last-write-wins,
-   * and re-published by the next decision for that device — so a write lost to a
-   * Ditto restart is repaired by the next sweep rather than lost. Actuation goes
-   * through the outbox, which is transactional and does not consult the twin at
-   * all. A reconciler that stopped controlling devices because a twin store was
-   * down would have chosen the wrong thing to be strict about.
-   *
-   * What this costs: the twin can lag, and during a Ditto outage anything
-   * reading the twin instead of the reconciler's own API sees stale state. That
-   * is visible — `twin.publish.failed` in the logs — rather than silent, which
-   * is the most that can be had without making the twin a critical path.
-   */
-  const guard = async (what: string, deviceId: string, fn: () => Promise<void>): Promise<void> => {
-    try {
-      await fn();
-    } catch (error) {
-      log('twin.publish.failed', { what, deviceId, error: String(error) });
-    }
-  };
+/*
+ * Every failure is logged and swallowed, which is a deliberate choice and the
+ * reason it is concentrated in one place rather than left to callers.
+ *
+ * These writes publish CURRENT STATE, not events: idempotent, last-write-wins,
+ * and re-published by the next decision for that device — so a write lost to a
+ * Ditto restart is repaired by the next sweep rather than lost. Actuation goes
+ * through the outbox, which is transactional and does not consult the twin at
+ * all. A reconciler that stopped controlling devices because a twin store was
+ * down would have chosen the wrong thing to be strict about.
+ *
+ * What this costs: the twin can lag, and during a Ditto outage anything reading
+ * the twin instead of the reconciler's own API sees stale state. That is visible
+ * — `twin.publish.failed` in the logs — rather than silent, which is the most
+ * that can be had without making the twin a critical path.
+ */
+async function guard(what: string, deviceId: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    log('twin.publish.failed', { what, deviceId, error: String(error) });
+  }
+}
 
+export function createProjector(store: TwinStore): Projector {
   return {
     enabled: true,
 

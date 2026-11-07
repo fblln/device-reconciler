@@ -13,16 +13,23 @@ its own deliberate gaps, and this one is those gaps, taken seriously:
 | ------------ | ------------------------------------- | ----------------------------------------------------------------------------------- |
 | the problem  | can I tell whether my command worked? | can I run that answer for a fleet, forever, through a restart?                      |
 | state        | in memory                             | Postgres: phase, clock model, generation, durable timer                             |
+| the twin     | a variable                            | **Eclipse Ditto**: desired and reported state, persisted and queryable              |
 | dispatch     | a function call                       | outbox → HTTP, idempotency-keyed, at-least-once                                     |
 | the platform | an in-process simulator               | **a runnable HTTP service** in this repo: OAuth2, pagination, 429s, signed webhooks |
+| the edge     | —                                     | **Eclipse Kanto**, opt-in: a real on-device twin (see below)                        |
 | failure      | a scenario                            | per-vendor rate limits, circuit breakers, jittered backoff, bounded concurrency     |
-| evidence     | ten golden timelines                  | OpenTelemetry metrics and a readout endpoint                                        |
+| evidence     | ten golden timelines                  | OpenTelemetry metrics, a readout endpoint, and the twin itself                      |
 | dependencies | none                                  | `pg`, OpenTelemetry. No cloud, no AWS, no broker.                                   |
 
-The argument behind both lives in **“Two Channels, Two Clocks”**
-(`/articles/two-channels-two-clocks/` on fblln.github.io). Read that for the
-reasoning; read the sibling repo for the pure logic; read this one for what it
-costs to operate.
+The argument behind both lives in **“Two Channels, Two Clocks”**, at
+`/articles/two-channels-two-clocks/` on fblln.github.io — written but not yet
+deployed, so that path is not linked here; this repository's rule is that a URL
+is either resolved or not cited. Its companion,
+[“The Health Check Was a Reverse Shell”](https://fblln.github.io/articles/the-health-check-was-a-reverse-shell/),
+is live and governs every readiness probe in this repo.
+
+Read the article for the reasoning; the sibling repo for the pure logic; this
+one for what it costs to operate.
 
 ---
 
@@ -122,12 +129,27 @@ the other end; there is no collector in this repo and no cloud anywhere), plus
 structured JSON logs and a readout at `/readout` and `/readout.txt`:
 
 ```
+decisions 555  (IDLE 131  CONVERGED 266  ISSUED 76  SUSPENDED 24  FAILED 58)
+
 vendor          correlated   unknown   clock-fallback   after   before
-ALL                    412     11.4%            48.3%     301       64
-badger                 139      8.6%             0.0%     118       10
-hare                   168      7.1%           100.0%     131       25
-tortoise               105     22.9%            61.0%      52       29
+ALL                   102     62.7%           89.2%      30        8
+badger                 40     62.5%           92.5%      14        1
+hare                   25     56.0%           88.0%       7        4
+tortoise               37     67.6%           86.5%       9        3
 ```
+
+That is a real forty-second run against the stack, not an illustration. Both
+numbers are high, and the reason is worth stating because it is the first thing
+a reader should query: **the rates are weighted by decisions, not by devices.**
+Roughly half the simulated fleet reports a counter, yet 89% of correlations take
+the clock fallback — because a device that echoes a generation resolves on its
+first correlation and stops, while a device that cannot be correlated keeps
+attempting one on every wake until its deadline. The devices that cannot decide
+dominate the denominator by construction.
+
+That makes the rate the right answer to "how much of my decision-making is
+guesswork" and the wrong answer to "what fraction of my fleet counts". Both are
+worth knowing; only the first is what this number is.
 
 - **unknown rate** — correlations that could not be decided at all. Zero means the
   tri-state was theatre and a boolean would have done. High means the declared
@@ -179,6 +201,189 @@ conflicts reported rather than resolved by last-writer-wins.
 The `local_change_at` timestamp is persisted because it **cannot be re-derived**:
 the evidence is the device still reporting the generation we converged at, and the
 moment we re-assert, the generation advances and the evidence is gone.
+
+### 6. The view model — what a UI may honestly say
+
+`GET /v1/devices` serves the half of this design a person ever sees. The
+vocabulary is Home Assistant's, which separates two ideas that look alike:
+[`assumed_state`](https://www.home-assistant.io/integrations/lock.mqtt/) (we
+never get a state report from this device, so show buttons rather than a toggle
+— the widget shape carries the uncertainty) and `optimistic` (show the new
+state immediately on sending a command).
+
+```
+dev-0000 hare      FAILED     not charging [failed, toggle], fault: terminal: rejected-by-vendor
+dev-0001 badger    CONVERGED  charging     [confirmed-estimated, toggle]
+dev-0005 tortoise  CONVERGED  not charging [confirmed-exact, toggle]
+```
+
+Two departures from Home Assistant, and both are earned rather than clever:
+
+- **`assumed` is derived, not declared.** The loop already knows whether
+  anything from a device has ever been placeable in time, and a computed flag
+  cannot drift out of date the way a hand-written one does. This is also where
+  durability pays off twice: the clock model it reads is a **column**, so a
+  restart does not re-report a perfectly correlatable device as `assumed` until
+  the next telemetry sample lands. In the sibling repo, on a two-minute feed,
+  that is minutes of showing buttons instead of a toggle after every deploy.
+- **`optimistic` stays configuration, per device.** Nothing derives it: it is a
+  judgement about which lie is worse. Showing “charging” a little early on a
+  charger is kind; showing “heating” to somebody who is cold is how people stop
+  trusting an app. A fleet is mixed, so it is a column rather than a setting.
+
+And because the loop holds a **deadline**, the view can say
+`confirming start (143s left)` instead of a spinner with no end, and name which
+of the three faults happened instead of the word “failed”. That is the whole
+argument for modelling the uncertainty rather than hiding it: it is the only
+reason the interface has anything honest to say.
+
+## The twin store is a real project, and so is the edge
+
+The strongest thing about this problem is that somebody else already published
+the half that is not the loop, and said so.
+
+### Eclipse Ditto holds the two states and declines to reconcile them
+
+[Ditto](https://eclipse.dev/ditto/basic-feature.html) is an open-source
+digital-twin framework that separates **reported** state (what the device said)
+from **desired** state (what a backend wants), persists both and indexes them.
+Its own documentation then says, of the gap between the two: _the logic for
+reconciling desired state with actual state is up to your application or device
+firmware_.
+
+That sentence is this repository's brief. So Ditto runs in `compose.yaml` and
+this reconciler is the application its docs ask for — which is worth more than a
+twin I wrote, because a twin I wrote would agree with me by construction.
+
+**The split is not arbitrary.** Ditto models a twin: the state of a thing, now.
+It has no model for a command in flight, its deadline, its delivery attempts,
+whether it has been dispatched exactly once, or a timer that must still fire
+after a restart. So:
+
+| in Ditto                         | in Postgres                                         |
+| -------------------------------- | --------------------------------------------------- |
+| desired and reported state       | the phase, and the in-flight command inside it      |
+| per device, queryable, versioned | outbox, inbox, durable timers, leases, decision log |
+
+Putting the phase in a twin store means encoding a state machine as twin
+properties and losing the transaction that makes the outbox atomic. Putting the
+twin in Postgres means reimplementing Ditto, badly.
+
+**Ditto's `_revision` cannot be the generation**, and this is the finding worth
+carrying away. The obvious shortcut is to let the twin store mint the
+desired-state counter, the way the Kubernetes API server sets
+`metadata.generation` and Azure IoT Hub manages `$version`. Ditto does maintain
+a monotonic `_revision` per thing. But it advances on **any** modification to
+the thing, including every reported-property write that lands from telemetry,
+whereas `metadata.generation` advances only when the spec changes. A counter
+that moves when the device reports in cannot say which instruction the device
+has acted on — it will advance several times between a command and its
+confirmation for reasons that have nothing to do with the command.
+
+So the platform minting its own per-device counter is not a preference. It is
+forced by what `_revision` means, which is the strongest available argument for
+["who mints the counter"](#who-mints-the-counter) below.
+
+**On the wire**, Azure IoT Plug and Play's acknowledgement convention rather
+than field names invented here. `desiredProperties` carries the value and the
+platform's version; `properties` carries `av` (the version being acknowledged),
+`ac` (200 applied, **202 in progress**, 400 refused, 500 failed) and `ad` (the
+reason the loop actually gave). An in-flight command reports 202, so anything
+subscribed to the twin sees the ack-is-not-an-actuation distinction in a
+published vocabulary instead of this project's:
+
+```json
+{
+  "features": {
+    "charging": {
+      "properties": {
+        "charging": {
+          "value": true,
+          "av": 1,
+          "ac": 400,
+          "ad": "terminal: rejected-by-vendor; waiting for a new intent"
+        },
+        "powerDeliveryState": "PLUGGED_IN:STOPPED",
+        "deviceTimeOnDeviceClock": 1794077684219,
+        "observedGeneration": null
+      },
+      "desiredProperties": { "value": true, "version": 1, "source": "operator" }
+    }
+  }
+}
+```
+
+That is a real thing read back out of a running Ditto, including the 400 for a
+vendor that refused the command. `deviceTimeOnDeviceClock` is named for the
+clock it is on because a twin store has no type system to brand it with, and the
+name is the only defence against somebody comparing it to one of ours.
+
+**Four Ditto services, not nine.** Ditto's own deployment runs policies, things,
+things-search, connectivity, a gateway, two UIs and an nginx doing basic auth.
+Dropped here: `things-search` (only needed for RQL queries; this addresses
+things by id), `connectivity` (only needed for Ditto's own AMQP/MQTT/Kafka
+connections), both UIs, and nginx — whose entire job is to authenticate and
+forward the identity as `x-ditto-pre-authenticated: nginx:<user>`. With
+`ENABLE_PRE_AUTHENTICATION=true` the client sends that
+[header](https://eclipse.dev/ditto/basic-auth.html) itself, and nginx, its
+htpasswd and its mounted config all go with it. The trust model is unchanged for
+a local stack with no published gateway port.
+
+### Eclipse Kanto is the other end of the wire, opt-in
+
+[Kanto](https://eclipse.dev/kanto/) runs on a device or gateway and keeps a
+[local digital twin](https://eclipse.dev/kanto/docs/concepts/local-digital-twins/)
+that works offline, synchronising both ways when the link returns: the cloud
+sets desired properties, the edge reports features and values. Same semantics as
+Ditto, on the device.
+
+`docker compose --profile edge up -d --wait` brings it up. **Verified by running
+it**, not by reading about it:
+
+- it connects to a plain `tcp://` broker with **no TLS, no Eclipse Hono and no
+  AWS**. Kanto demands a CA certificate only when the hub scheme is a secure
+  one, which is what makes a fully local, credential-free edge tier possible at
+  all. Its documented cloud paths are AWS IoT, Azure IoT Hub, or Hono — none of
+  them Ditto directly, and two of them ruled out here.
+- it subscribes and publishes on Hono's MQTT topics (`e/#`, `t/#`,
+  `command//+/req/#`, `edge/thing/request`) carrying **Ditto Protocol**
+  envelopes. Its [`go.mod`](https://github.com/eclipse-kanto/local-digital-twins)
+  requires `eclipse/ditto-clients-golang` and it implements Ditto's topic
+  criteria, so the protocol match with the cloud twin is real rather than hoped
+  for.
+- a round trip through its local bus works. Publishing to `edge/thing/request`
+  returns
+  `{"deviceId":"energy:edge-0001","tenantId":"energy","policyId":"energy:edge-0001"}`
+  — note the `policyId`, which is Ditto's concept, from Kanto's own mouth.
+
+Kanto publishes **no container image**: its
+[releases](https://github.com/eclipse-kanto/kanto/releases) are `.deb`, `.rpm`
+and `.tar.gz` for linux x86_64/arm64/armv7, built to be installed as systemd
+units on a device. So `kanto/Dockerfile` downloads the release tarball and
+copies out the static Go binary. That is the honest cost of putting it in
+Compose, and it is why this is a profile rather than part of the default stack.
+
+What is **not** wired, and not pretended: carrying Kanto's twin into Ditto needs
+Ditto to open an `mqtt-5` connection, and Ditto's connections live in the
+`connectivity` service this compose file omits. The next step is known; the
+round trip has not been run, so the README does not say it has.
+
+### Why a simulated fleet survives next to real software
+
+Because they are good at different things, and this is a design decision rather
+than a shortcut.
+
+Kanto gives realism. It does not give **controllable failure injection**. A
+clock ten minutes fast, telemetry delivered out of order, a duplicate webhook,
+a device that acknowledges and never applies, half a fleet that reports a
+counter and half that does not — none of that can be asked of real software on
+demand, and all of it is the pathology matrix the tests are worth running for.
+`SEED` makes every one of those reproducible, which is what lets an agent replay
+an interesting failure instead of waiting for it.
+
+So: a deterministic simulator for the matrix, and real software pointed at once
+to show the integration is not fiction. The sibling repository documents the
+same split for the same reason.
 
 ## Prior art
 
@@ -343,15 +548,19 @@ often the fallback was needed anyway.
 
 ## Layout
 
-| path            | what                                                                                                                     | why separate                                                                                                                      |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `src/core/`     | the pure half: time, clock, correlation, decision, contracts, rate limit, breaker, backoff, schedule, signature, readout | no I/O, no `Date.now()`, no randomness it does not receive — testable with a virtual clock, and the only code under the 100% gate |
-| `src/platform/` | the runnable mock aggregator platform                                                                                    | a fake with a clock, because the failures here are timing failures                                                                |
-| `src/adapter/`  | HTTP client and the per-vendor gate                                                                                      | the error model is the design: outcomes split by what the caller should _do_                                                      |
-| `src/store/`    | Postgres: devices, outbox, inbox, channels, decisions                                                                    | one parse boundary; the two channels stay two tables                                                                              |
-| `src/service/`  | worker, dispatcher, ingest, sweep, queue, report                                                                         | the loops. No decisions live here                                                                                                 |
-| `src/app.ts`    | the reconciler process                                                                                                   | wiring only                                                                                                                       |
-| `db/schema.sql` | the durable state, with the reasoning                                                                                    | the outbox and bigint-milliseconds notes are the two to read                                                                      |
+| path                | what                                                                                                                     | why separate                                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `src/core/`         | the pure half: time, clock, correlation, decision, contracts, rate limit, breaker, backoff, schedule, signature, readout | no I/O, no `Date.now()`, no randomness it does not receive — testable with a virtual clock, and the only code under the 100% gate |
+| `src/platform/`     | the runnable mock aggregator platform                                                                                    | a fake with a clock, because the failures here are timing failures                                                                |
+| `src/adapter/`      | HTTP client and the per-vendor gate                                                                                      | the error model is the design: outcomes split by what the caller should _do_                                                      |
+| `src/store/`        | Postgres: devices, outbox, inbox, channels, decisions                                                                    | one parse boundary; the two channels stay two tables                                                                              |
+| `src/service/`      | worker, dispatcher, ingest, sweep, queue, report                                                                         | the loops. No decisions live here                                                                                                 |
+| `src/twin/`         | the Ditto adapter, and the phase → Plug and Play mapping                                                                 | Ditto's resource paths in one file, the reconciler's phases in another: swapping the twin store is a change to one of them        |
+| `src/app.ts`        | the reconciler process                                                                                                   | wiring only                                                                                                                       |
+| `db/schema.sql`     | the durable state, with the reasoning                                                                                    | the outbox and bigint-milliseconds notes are the two to read                                                                      |
+| `kanto/`            | the Dockerfile Kanto does not ship, and its config                                                                       | the edge tier is opt-in, so its cost is opt-in too                                                                                |
+| `test/core/`        | unit, contract and property tests on a virtual clock                                                                     | the only code under the 100% gate                                                                                                 |
+| `test/integration/` | Testcontainers Postgres, the platform in process, a live Ditto                                                           | SQL cannot be tested against a fake of my beliefs about SQL                                                                       |
 
 `src/core/time.ts`, `clock.ts`, `correlate.ts`, `reconcile.ts` and `contracts.ts`
 are **ported verbatim** from the sibling repo (plus `Step.correlation`), with a
@@ -363,11 +572,24 @@ would destroy the property it exists to demonstrate.
 
 ```bash
 npm install
-npm run up          # docker compose up -d --wait — Postgres, platform, reconciler
+npm run up          # docker compose up -d --wait — seven services, all healthy
 npm run demo        # drives the fleet and prints the readout
-npm run logs        # follow all three services
+npm run check       # every gate: typecheck, lint, format, coverage, unit, integration
+npm run logs
 npm run down
+
+docker compose --profile edge up -d --wait   # plus Mosquitto and Eclipse Kanto
 ```
+
+`npm run up` starts Postgres, MongoDB, three Ditto services, the simulated
+aggregator platform and the reconciler. Useful endpoints once it is up:
+
+| endpoint                                      | what                                                     |
+| --------------------------------------------- | -------------------------------------------------------- |
+| `localhost:9910/v1/devices`                   | the **view model**: confidence, widget, countdown, fault |
+| `localhost:9910/readout.txt`                  | the two headline rates, as text                          |
+| `localhost:9911/metrics`                      | the same, as Prometheus                                  |
+| `localhost:8080/api/2/things/energy:dev-0000` | the twin, in Ditto (needs the pre-auth header)           |
 
 `--wait` returns only once every service reports healthy, so a script or an agent
 can bring the stack up and start asserting with no `sleep`. That works because
@@ -381,9 +603,10 @@ PORT=9900 WEBHOOK_URL=http://localhost:9910/webhooks npm run platform
 DATABASE_URL=postgres://... npm run reconciler
 ```
 
-Requires Node 24+, which strips TypeScript natively — **no build step, no
-bundler, no `dist/`**. Dev tooling is TypeScript 7, oxlint 1.x and Prettier 3.x,
-all current.
+Requires Node 24+ (the image and CI run 26), which strips TypeScript natively —
+**no build step, no bundler, no `dist/`**. Dev tooling is TypeScript 7, oxlint
+1.x, Prettier 3.x and [Testcontainers](https://node.testcontainers.org/), all
+current.
 
 ## Health checks are not `/dev/tcp`
 
@@ -405,7 +628,10 @@ Listening and ready are different states. Where an image has a runtime but no
 HTTP client, the probe to reach for is a `/proc/net/tcp` grep in exec form —
 reading a file is not opening a socket.
 
-Long version: **“The Health Check Was a Reverse Shell”** on fblln.github.io.
+Long version: [**“The Health Check Was a Reverse Shell”**](https://fblln.github.io/articles/the-health-check-was-a-reverse-shell/),
+which is where this rule came from — a GuardDuty High-severity reverse-shell
+finding on a CI runner that turned out to be a Docker health check asking
+WireMock whether it had finished starting.
 
 ## Engineering standards
 
@@ -422,29 +648,86 @@ Long version: **“The Health Check Was a Reverse Shell”** on fblln.github.io.
 - **Strict TypeScript**: `erasableSyntaxOnly`, `noUncheckedIndexedAccess`,
   `exactOptionalPropertyTypes`, `noPropertyAccessFromIndexSignature`.
 
-## Status: what is not done yet
+## Status
 
-Honest list, because an unfinished thing described as finished is worse than an
-unfinished thing.
+`docker compose up -d --wait` brings up seven services — Postgres, MongoDB,
+three Ditto services, the simulated aggregator platform and the reconciler — and
+returns only when every one of them reports healthy. `npm run demo` then drives
+the fleet and prints the readout. Both have been run; the numbers in this README
+are from a run, not from an intention.
 
-- **Tests are not written.** The intended shape, and the bar the sibling repo
-  sets: unit and property tests over `src/core/**` on a virtual clock with a
-  seeded LCG and a 100% line/function coverage gate (`npm run test:coverage` is
-  wired for it); Testcontainers integration tests against Postgres and the
-  in-process platform; a **restart test** that `SIGKILL`s the reconciler between
-  the outbox commit and the dispatch, restarts it, and asserts the platform's
-  `actuations` counter stayed at one while `idempotentReplays` rose; and a perf
-  budget on the decision function.
-- **CI workflow** is not written. It should run typecheck, lint, format, the
-  coverage gate, the integration suite, and a `docker compose up --wait` smoke.
-- **Partly executed.** The mock platform has been run and exercised by hand:
-  OAuth2, pagination, the Azure `av`/`ac`/`ad` acknowledgement, and an idempotent
-  replay returning the identical response for a repeated key while the command
-  count stayed at one — which is the exact property the restart test will assert.
-  The reconciler has **not** been run against a live Postgres, so expect the
-  first integration pass to find SQL and wiring defects.
-- `npm run demo` and the readout numbers above are the intended output, not a
-  recorded run.
+**Gates, all green.** `npm run check` runs typecheck, oxlint, Prettier, the
+coverage gate, the unit and property suites, the perf budget and the integration
+suite.
+
+| gate           | state                                                                                          |
+| -------------- | ---------------------------------------------------------------------------------------------- |
+| typecheck      | TypeScript 7, `erasableSyntaxOnly` + `noUncheckedIndexedAccess` + `exactOptionalPropertyTypes` |
+| lint / format  | oxlint 1.x, zero warnings; Prettier 3.x                                                        |
+| `src/core/**`  | **100% lines, branches and functions**, 166 tests in ~0.3s                                     |
+| property tests | 400 adversarial worlds + 200 benign, seeded LCG, contracts on every decision                   |
+| perf budget    | throughput floor on the decision function                                                      |
+| integration    | 12 tests against a Testcontainers Postgres and a live Ditto                                    |
+| CI             | `.github/workflows/ci.yml`, fast job and Docker job                                            |
+
+**What the tests found, rather than review.** The repository's claim is that the
+checks find things, so here is the ledger from this pass:
+
+- `signature.ts` accepted `t=` with no value as "signed at the epoch", because
+  `Number('')` is `0` and `0` is finite. That slipped past the freshness
+  window — the cheap check whose whole job is to reject replay floods before any
+  HMAC runs — and was caught only by the MAC, then reported as `bad-signature`.
+  Not exploitable (forging a digest for `t=0` still needs the secret) but wrong
+  in the metric and wrong in the order of checks.
+- a signed webhook for a device we do not manage returned **500**. Both channel
+  tables reference `device`, so applying the event was a foreign-key violation.
+  That is the worst available reply: an at-least-once sender retries a 5xx
+  forever, for an event that can never succeed. Now recorded in the inbox with
+  `processed_at` null — a misconfiguration somebody should see — and answered
+  2xx.
+- the restart test passed a mutation it should have failed. Making command ids
+  random left it green, because after a `SIGKILL` the restarted process
+  re-drives the outbox **row**, which already holds the id, so the idempotency
+  key never has to do anything. The restart test proves durability — persisting
+  `initialPhase` instead of the real phase, exactly the sibling's in-memory gap,
+  fails it immediately — but not idempotency. That now has its own test, which
+  the mutation kills.
+
+Each is documented at the site of its fix.
+
+**Three things bringing up Ditto taught**, each recorded in `compose.yaml` next
+to the log line it produces, because they are the kind of thing that is obvious
+once and never again:
+
+1. every Ditto service must answer to the network alias `ditto-cluster`, or
+   Pekko's cluster bootstrap resolves zero contact points and retries forever.
+2. the Ditto services must **not** wait on each other with
+   `condition: service_healthy`. A Ditto service becomes healthy only once the
+   cluster has formed, and forming needs two peers — so that condition makes
+   each wait for a peer that is waiting for it.
+3. `/health` answers `503 DOWN` on this deliberately trimmed stack while every
+   API call works and `/status/health` answers `200 UP`. The probe has to be the
+   latter: one that reports a healthy dependency as down sends somebody to debug
+   the wrong thing.
+
+**What is still open.**
+
+- **The Kanto → Ditto bridge.** Kanto runs, connects to a plain local broker and
+  speaks Ditto Protocol, but nothing yet carries its twin into
+  Ditto. That needs Ditto to open an `mqtt-5`
+  [connection](https://eclipse.dev/ditto/connectivity-protocol-bindings-mqtt5.html),
+  which lives in its `connectivity` service — one of the two services this
+  compose file omits to keep `--wait` fast.
+- **Mutation testing is manual.** Three mutants were planted and checked by
+  hand on the paths that matter (the command-id derivation, the phase persist,
+  the platform's replay counter). A `cargo mutants` equivalent for TypeScript —
+  StrykerJS — is not wired in.
+- **The unknown-correlation rate is weighted by decisions, not by devices**, and
+  that is worth knowing before reading it. A device that cannot be correlated
+  keeps generating correlation attempts while it waits; one that echoes a
+  generation resolves on the first. So the rate answers "how much of my
+  decision-making is guesswork", which is the right operational question, and
+  **not** "what fraction of my fleet counts", which it over-states.
 
 ## Deliberate limits
 

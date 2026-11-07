@@ -45,6 +45,7 @@ import { tx, type Db } from '../store/db.ts';
 import { claim, persist } from '../store/devices.ts';
 import { enqueue } from '../store/outbox.ts';
 import { record } from '../store/decisions.ts';
+import type { Projector } from '../twin/project.ts';
 import { mapWithLimit } from './queue.ts';
 import { log, type Instruments } from '../telemetry.ts';
 
@@ -58,11 +59,17 @@ export type WorkerConfig = Readonly<{
   lease: Duration;
 }>;
 
-export type WorkerDeps = Readonly<{ db: Db; cfg: WorkerConfig; instruments: Instruments }>;
+export type WorkerDeps = Readonly<{
+  db: Db;
+  cfg: WorkerConfig;
+  instruments: Instruments;
+  /** The twin projection. `noTwin` when no twin store is configured. */
+  twin: Projector;
+}>;
 
 /** Devices processed in this pass. Zero means the loop should pause. */
 export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<number> {
-  const { db, cfg, instruments } = deps;
+  const { db, cfg, instruments, twin } = deps;
   const batch = await claim(db, now, cfg.batchSize, cfg.lease);
   if (batch.length === 0) return 0;
 
@@ -155,6 +162,27 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
         vendor: device.vendor,
       });
     }
+    /*
+     * The twin, AFTER the transaction. Deliberately outside it: Ditto is not a
+     * participant in the atomic write that makes a restart safe, and awaiting an
+     * HTTP call inside a database transaction holds a Postgres connection open
+     * for the duration of somebody else's outage. The projection is
+     * last-write-wins and self-healing, so publishing a committed decision late
+     * is fine and publishing an uncommitted one would not be.
+     */
+    await twin.publish({
+      deviceId: device.deviceId,
+      vendor: device.vendor,
+      phase: step.state,
+      obs: device.obs,
+      why: step.why,
+      desired: {
+        charging: device.stored.charging,
+        generation: step.command?.generation ?? device.generation,
+        source: device.stored.source,
+      },
+    });
+
     instruments.reconcileDuration.record(performance.now() - started, { vendor: device.vendor });
     return step;
   });

@@ -36,6 +36,7 @@ import { markStaleUnreachable } from '../store/channels.ts';
 import { register } from '../store/devices.ts';
 import type { PlatformClient } from '../adapter/client.ts';
 import { log } from '../telemetry.ts';
+import type { Projector } from '../twin/project.ts';
 
 export type SweepConfig = Readonly<{ staleAfter: Duration }>;
 
@@ -46,7 +47,12 @@ export async function markQuiet(db: Db, cfg: SweepConfig, now: Instant): Promise
   return marked;
 }
 
-export async function syncFleet(db: Db, client: PlatformClient, now: Instant): Promise<number> {
+export async function syncFleet(
+  db: Db,
+  client: PlatformClient,
+  twin: Projector,
+  now: Instant,
+): Promise<number> {
   const listed = await client.listDevices();
   if (!listed.ok) {
     // A failed fleet listing is not an emergency: the devices we already know
@@ -60,7 +66,18 @@ export async function syncFleet(db: Db, client: PlatformClient, now: Instant): P
     const inserted = await tx(db, (c) =>
       register(c, device.deviceId, device.vendor, initialPhase(now), unknownClock, now),
     );
-    if (inserted) added += 1;
+    if (inserted) {
+      added += 1;
+      /*
+       * Create the twin only for a device we have just inserted. `ensure` is a
+       * whole-thing PUT, which REPLACES the thing — running it on every sweep
+       * would wipe the reported properties of the entire fleet every thirty
+       * seconds. `register`'s boolean is an `on conflict do nothing`, so it is
+       * exactly the "first time we have seen this device" signal needed, and it
+       * is already durable.
+       */
+      await twin.ensure(device.deviceId, device.vendor);
+    }
   }
   if (added > 0) log('sweep.registered', { devices: added, total: listed.value.length });
   return added;

@@ -47,6 +47,10 @@ export type Config = Readonly<{
   publicUrl: string;
   webhookSecret: string;
   signatureTolerance: Duration;
+  /** Empty disables the twin projection entirely. See src/twin/ditto.ts. */
+  dittoUrl: string;
+  dittoNamespace: string;
+  dittoSubject: string;
   commandTimeout: Duration;
   skewBound: Duration;
   maxLatency: Duration;
@@ -88,6 +92,18 @@ export function loadConfig(): Config {
     // window is bounded. It is NOT a replay defence on its own — the unique
     // index on inbox.event_id is. See src/core/signature.ts.
     signatureTolerance: ms('SIGNATURE_TOLERANCE_MS', 5 * 60_000),
+
+    // The twin store. Empty by default, deliberately: `npm test` and a bare
+    // `node src/app.ts` must not require a five-container Ditto stack to be up,
+    // and the twin is a projection rather than a critical path. Compose sets it.
+    dittoUrl: str('DITTO_URL', ''),
+    dittoNamespace: str('DITTO_NAMESPACE', 'energy'),
+    // `<issuer>:<subject>`, the identity Ditto's own nginx forwards as
+    // x-ditto-pre-authenticated. Keeping the issuer as `nginx` is not a
+    // pretence that nginx is there — it is the issuer name Ditto's default
+    // policies and its documentation use, so a thing created by this
+    // reconciler is readable from Ditto's UI with the normal dev credentials.
+    dittoSubject: str('DITTO_SUBJECT', 'nginx:ditto'),
 
     // A promise to a user, not a technical constant: it must exceed the worst
     // realistic telemetry interval by a comfortable margin, or confirmations

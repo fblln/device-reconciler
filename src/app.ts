@@ -35,6 +35,8 @@ import { instant, type Duration, type Instant } from './core/time.ts';
 import { staleAfter } from './service/sweep.ts';
 import { createClient, defaultRequestTimeout } from './adapter/client.ts';
 import { createGate } from './adapter/gate.ts';
+import { createTwinStore, defaultDittoTimeout } from './twin/ditto.ts';
+import { createProjector, noTwin } from './twin/project.ts';
 import { connect, migrate } from './store/db.ts';
 import { setIntent, viewRows } from './store/devices.ts';
 import { describe, present } from './core/presentation.ts';
@@ -69,11 +71,34 @@ const client = createClient({
   defaultRetryAfter: cfg.breaker.cooloff,
 });
 const gate = createGate(cfg.vendorLimits, cfg.breaker);
+
+/*
+ * The twin store, if one is configured. Eclipse Ditto holds desired and reported
+ * state and, in its own words, leaves the reconciling between them to your
+ * application — this process is that application. Postgres keeps the operational
+ * state Ditto has no model for: the phase, the outbox, the durable timers.
+ *
+ * Absent by default so neither the tests nor a bare `node src/app.ts` require a
+ * five-container stack to be up. See src/twin/ditto.ts for why that is safe and
+ * what it costs.
+ */
+const twin =
+  cfg.dittoUrl === ''
+    ? noTwin
+    : createProjector(
+        createTwinStore({
+          baseUrl: cfg.dittoUrl,
+          namespace: cfg.dittoNamespace,
+          subject: cfg.dittoSubject,
+          timeout: defaultDittoTimeout,
+        }),
+      );
 const dice = rng(cfg.seed ^ 0x5f5f);
 
 const worker = {
   db,
   instruments,
+  twin,
   cfg: {
     override: cfg.override,
     commandTimeout: cfg.commandTimeout,
@@ -208,7 +233,7 @@ void loop('reconcile', (at) => reconcileBatch(worker, at));
 void loop('dispatch', (at) => dispatchBatch(dispatcher, at));
 void loop('sweep', async (at) => {
   await markQuiet(db, { staleAfter: staleAfter(cfg.schedule.sweepInterval) }, at);
-  await syncFleet(db, client, at);
+  await syncFleet(db, client, twin, at);
   // Always "nothing found", so the loop always pauses: the sweep is a periodic
   // job and must not spin just because it registered a device.
   return 0;

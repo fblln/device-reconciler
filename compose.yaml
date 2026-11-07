@@ -1,6 +1,7 @@
 # ============================================================================
 # One command brings up the whole system: `docker compose up -d --wait`
-# (or `npm run up`). Postgres, the mock aggregator platform, and the reconciler.
+# (or `npm run up`). Postgres, Eclipse Ditto as the twin store, the simulated
+# aggregator platform, and the reconciler.
 # No cloud service, no credentials, no vendor account, no hardware.
 #
 # `--wait` is load-bearing for the agentic-devex requirement: it returns only
@@ -31,6 +32,158 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # --------------------------------------------------------------------------
+  # THE TWIN STORE: Eclipse Ditto.
+  #
+  # Ditto stores reported state (from the device) separately from desired state
+  # (set by a backend), persists both and indexes them — and its own docs say
+  # the logic for reconciling the two "is up to your application or device
+  # firmware". The `reconciler` service below is that application. Running
+  # against the project whose documentation asks for this loop is worth more
+  # than running against a fake that agrees with me by construction.
+  #
+  # FOUR SERVICES, NOT NINE. Ditto's own compose deployment runs policies,
+  # things, things-search, connectivity, gateway, two UIs and an nginx doing
+  # basic auth. Dropped here:
+  #   nginx        its only job is to authenticate and forward the identity as
+  #                `x-ditto-pre-authenticated: nginx:<user>`. The gateway below
+  #                has ENABLE_PRE_AUTHENTICATION=true and the client sends that
+  #                header itself, so nginx, its htpasswd, its mime.types and its
+  #                CORS config all go. Same trust model on a local network with
+  #                no published gateway port: whoever can reach it is trusted.
+  #   things-search  only needed for RQL search queries. This reconciler
+  #                addresses things by id and never searches.
+  #   connectivity   only needed for Ditto's own inbound/outbound connections
+  #                (AMQP, MQTT, Kafka). We speak to the HTTP API directly.
+  #   the two UIs  useful for a human, dead weight for `--wait`.
+  #
+  # That is the difference between a stack an agent can bring up in a loop and
+  # one it cannot.
+  # --------------------------------------------------------------------------
+  mongodb:
+    # 7.0 because that is what Ditto's own deployment/docker/docker-compose.yml
+    # pins on master, i.e. the version Ditto 3.9 is actually tested against.
+    # This repository's rule is to run the latest of everything it owns; a
+    # transitive dependency of somebody else's product is not one of those, and
+    # chasing MongoDB 9 here would mean debugging Ditto rather than this.
+    image: mongo:7.0
+    # --noscripting: Ditto never needs server-side JS, and leaving it on is a
+    # remote-code-execution surface in exchange for nothing. Ditto's own compose
+    # file sets the same flag.
+    command: mongod --storageEngine wiredTiger --noscripting
+    # No published port. Nothing outside the compose network has any business
+    # talking to the twin store's database, and an exposed unauthenticated
+    # MongoDB is the oldest mistake in this genre.
+    healthcheck:
+      # `mongosh` ships in the image and speaks the wire protocol, so this
+      # proves the server answers rather than that a port is bound. A real
+      # client, not a shell holding a socket — see the Dockerfile.
+      test: ['CMD', 'mongosh', '--quiet', '--eval', 'db.adminCommand({ping:1}).ok']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  ditto-policies:
+    image: eclipse/ditto-policies:3.9.8
+    # THE NETWORK ALIAS IS LOAD-BEARING, and leaving it out is why this stack
+    # first refused to start. Ditto's services form a Pekko cluster and find
+    # each other by DNS: cluster bootstrap resolves `ditto-cluster` and waits
+    # for at least two contact points before forming. Every Ditto service
+    # therefore answers to that same alias, which is exactly what Ditto's own
+    # compose file does. Without it the log reads
+    # "Discovered [0] contact points, confirmed [0], which is less than the
+    # required [2], retrying" — forever, with a container that never turns
+    # healthy and never says why in terms of anything you configured.
+    networks:
+      default:
+        aliases: ['ditto-cluster']
+    environment: &ditto_env
+      BIND_HOSTNAME: 0.0.0.0
+      MONGO_DB_HOSTNAME: mongodb
+      # Single-node: Pekko clustering is pointless here and its failure detector
+      # will otherwise spend the first two minutes deciding whether it is alone.
+      JAVA_TOOL_OPTIONS: >-
+        -XX:+ExitOnOutOfMemoryError -XX:MaxRAMPercentage=40 -Xss512k
+        -Dpekko.cluster.downing-provider-class=
+        -Dpekko.coordinated-shutdown.exit-jvm=on
+    depends_on:
+      mongodb: { condition: service_healthy }
+    healthcheck:
+      # Ditto's images ship curl and its services serve /alive on 7626. This is
+      # the probe Ditto's own compose file uses, and it is a real HTTP client
+      # rather than a shell redirection into /dev/tcp.
+      test: ['CMD', 'curl', '--fail', '--silent', 'http://localhost:7626/alive']
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  ditto-things:
+    image: eclipse/ditto-things:3.9.8
+    # THE NETWORK ALIAS IS LOAD-BEARING, and leaving it out is why this stack
+    # first refused to start. Ditto's services form a Pekko cluster and find
+    # each other by DNS: cluster bootstrap resolves `ditto-cluster` and waits
+    # for at least two contact points before forming. Every Ditto service
+    # therefore answers to that same alias, which is exactly what Ditto's own
+    # compose file does. Without it the log reads
+    # "Discovered [0] contact points, confirmed [0], which is less than the
+    # required [2], retrying" — forever, with a container that never turns
+    # healthy and never says why in terms of anything you configured.
+    networks:
+      default:
+        aliases: ['ditto-cluster']
+    environment: *ditto_env
+    depends_on:
+      # service_started, NOT service_healthy, and that is the second thing this
+      # stack taught me. A Ditto service only becomes healthy once the Pekko
+      # cluster has formed, and the cluster needs two contact points to form —
+      # so waiting for policies to be HEALTHY before starting things means
+      # policies waits for a peer that is waiting for policies. One contact
+      # point, forever. Ditto's own compose file uses plain `depends_on` here
+      # for exactly this reason; mongodb is the only thing worth waiting on.
+      mongodb: { condition: service_healthy }
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', '--silent', 'http://localhost:7626/alive']
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  ditto:
+    image: eclipse/ditto-gateway:3.9.8
+    # THE NETWORK ALIAS IS LOAD-BEARING, and leaving it out is why this stack
+    # first refused to start. Ditto's services form a Pekko cluster and find
+    # each other by DNS: cluster bootstrap resolves `ditto-cluster` and waits
+    # for at least two contact points before forming. Every Ditto service
+    # therefore answers to that same alias, which is exactly what Ditto's own
+    # compose file does. Without it the log reads
+    # "Discovered [0] contact points, confirmed [0], which is less than the
+    # required [2], retrying" — forever, with a container that never turns
+    # healthy and never says why in terms of anything you configured.
+    networks:
+      default:
+        aliases: ['ditto-cluster']
+    environment:
+      <<: *ditto_env
+      # The whole reason nginx is absent. With this on, the gateway trusts an
+      # `x-ditto-pre-authenticated: <issuer>:<subject>` header, which is exactly
+      # what Ditto's own nginx.conf injects from $remote_user after basic auth.
+      ENABLE_PRE_AUTHENTICATION: 'true'
+      DEVOPS_PASSWORD: foobar
+    depends_on:
+      # Again service_started: see the note on ditto-things. The gateway is the
+      # one Ditto service with a health check anything else waits on, and it
+      # turns healthy only once the cluster is up — which is precisely the
+      # signal the reconciler wants.
+      mongodb: { condition: service_healthy }
+    ports: ['8080:8080']
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', '--silent', 'http://localhost:7626/alive']
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
 
   platform:
     build: .
@@ -68,8 +221,19 @@ services:
       # (that is what the breaker and the backoff are for), so making it wait
       # here would only hide whether that retry path works.
       platform: { condition: service_started }
+      # service_healthy here, unlike the platform: the twin is created once per
+      # device when it is first registered, and a gateway that is not yet up
+      # would mean the first sweep logs twin.publish.failed for the whole fleet
+      # and those things are only created on the next restart. Cheap to wait for
+      # at startup, annoying to debug otherwise.
+      ditto: { condition: service_healthy }
     environment:
       DATABASE_URL: postgres://reconciler:reconciler@postgres:5432/reconciler
+      # The twin store. Absent in this variable's default, so tests and a bare
+      # `node src/app.ts` need no Ditto; set here because compose has one.
+      DITTO_URL: http://ditto:8080
+      DITTO_NAMESPACE: energy
+      DITTO_SUBJECT: nginx:ditto
       PLATFORM_URL: http://platform:9900
       PLATFORM_CLIENT_ID: reconciler
       PLATFORM_CLIENT_SECRET: dev-client-secret

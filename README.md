@@ -1,4 +1,4 @@
-# device-reconciler-platform
+# device-reconciler
 
 A desired-state reconciler for energy devices — EV chargers, inverters, batteries,
 heat pumps — reached through an **aggregator platform** that exposes two separate
@@ -9,7 +9,7 @@ is the **logical** half: a pure, dependency-free simulation that works out what 
 even means to know whether a command took effect. That repository's README names
 its own deliberate gaps, and this one is those gaps, taken seriously:
 
-|              | `device-reconciler`                   | `device-reconciler-platform`                                                        |
+|              | `device-reconciler`                   | `device-reconciler`                                                                 |
 | ------------ | ------------------------------------- | ----------------------------------------------------------------------------------- |
 | the problem  | can I tell whether my command worked? | can I run that answer for a fleet, forever, through a restart?                      |
 | state        | in memory                             | Postgres: phase, clock model, generation, durable timer                             |

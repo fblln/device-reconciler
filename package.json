@@ -1,5 +1,5 @@
 {
-  "name": "device-reconciler-platform",
+  "name": "device-reconciler",
   "version": "0.1.0",
   "private": true,
   "type": "module",

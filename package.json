@@ -19,24 +19,32 @@
     "lint": "oxlint src test",
     "fmt": "prettier --write .",
     "fmt:check": "prettier --check .",
-    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm run test:coverage && npm run test:core && npm run test:integration",
+    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm run test:coverage && npm run test:core && npm run test:unit && npm run test:integration",
     "demo": "node src/demo.ts",
     "platform": "node src/platform/main.ts",
-    "reconciler": "node src/app.ts"
+    "reconciler": "node src/app.ts",
+    "hono:up": "docker compose -f compose.yaml -f compose.hono.yaml up -d --wait && npm run hono:provision",
+    "hono:provision": "node src/edge/provision.ts",
+    "hono:test": "HONO_TEST=1 node --test test/edge/hono.test.ts",
+    "hono:edge": "npm run hono:provision && docker compose -f compose.yaml -f compose.hono.yaml --profile edge up -d --build --wait",
+    "hono:down": "docker compose -f compose.yaml -f compose.hono.yaml --profile edge down",
+    "hono:test:edge": "KANTO_TEST=1 node --test test/edge/kanto.test.ts",
+    "test:unit": "node --test 'test/unit/*.test.ts'"
   },
   "dependencies": {
-    "pg": "^8.23.1",
     "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/exporter-prometheus": "^0.301.0",
     "@opentelemetry/sdk-node": "^0.301.0",
-    "@opentelemetry/exporter-prometheus": "^0.301.0"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.2.1",
     "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
+    "mqtt": "^5.16.1",
     "oxlint": "^1.92.0",
     "prettier": "^3.9.10",
     "testcontainers": "^12.2.1",
-    "@testcontainers/postgresql": "^12.2.1",
     "typescript": "^7.0.2"
   }
 }

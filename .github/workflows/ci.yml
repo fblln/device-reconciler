@@ -60,6 +60,7 @@ jobs:
       # order of magnitude below a laptop precisely so a shared runner cannot
       # flake it while a real regression still fails it.
       - run: npm run test:core
+      - run: npm run test:unit
 
   integration:
     name: integration against Postgres and Ditto
@@ -110,3 +111,25 @@ jobs:
       - name: tear down
         if: always()
         run: docker compose down -v
+
+  edge:
+    name: Kanto, Hono, Ditto and the durable reconciler
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+      - run: npm ci
+      - run: npm run hono:up
+      - run: npm run hono:test
+      - run: npm run hono:edge
+      - run: npm run hono:test:edge
+      - name: edge logs on failure
+        if: failure()
+        run: docker compose -f compose.yaml -f compose.hono.yaml --profile edge logs --tail 150
+      - name: tear down edge stack
+        if: always()
+        run: docker compose -f compose.yaml -f compose.hono.yaml --profile edge down -v

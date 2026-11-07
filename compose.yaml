@@ -202,12 +202,10 @@ services:
   # `eclipse/ditto-clients-golang` and it implements Ditto's topic criteria.
   # So the protocol match with the cloud twin is real, not hoped for.
   #
-  # WHAT IS NOT WIRED, and why it is not pretended: bridging this broker to the
-  # Ditto instance above needs Ditto to open an `mqtt-5` CONNECTION, and Ditto's
-  # connections live in its `connectivity` service — one of the two services
-  # this compose file deliberately omits to keep `--wait` fast. Adding it back
-  # is the next step and it is a known quantity; claiming the round trip works
-  # before running it would not be.
+  # The plain edge profile below is the local-broker experiment. The optional
+  # compose.hono.yaml overlay replaces its hub with real Eclipse Hono and adds
+  # Ditto connectivity plus a durable edge reconciler. See hono/README.md for
+  # both directions, the sample contract, and executable acceptance tests.
   #
   # Kanto publishes no container image at all (releases are .deb/.rpm/.tar.gz
   # for linux x86_64/arm64/armv7, built to be installed as systemd units on a

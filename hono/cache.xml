@@ -1,0 +1,7 @@
+<infinispan xmlns="urn:infinispan:config:13.0">
+  <cache-container default-cache="command-router">
+    <local-cache name="command-router" simple-cache="true">
+      <encoding media-type="application/x-protostream" />
+    </local-cache>
+  </cache-container>
+</infinispan>

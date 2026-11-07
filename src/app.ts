@@ -29,6 +29,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { createEdgeAdapter } from './edge/adapter.ts';
 import { loadConfig } from './config.ts';
 import { rng } from './core/lcg.ts';
 import { instant, type Duration, type Instant } from './core/time.ts';
@@ -60,16 +61,19 @@ const db = connect(cfg.databaseUrl);
 // to work. Failing loudly at startup is the one place crashing is the right move.
 await migrate(db, new URL('../db/schema.sql', import.meta.url).pathname);
 
-const client = createClient({
-  baseUrl: cfg.platformUrl,
-  clientId: cfg.clientId,
-  clientSecret: cfg.clientSecret,
-  requestTimeout: defaultRequestTimeout,
-  // When a 429 arrives without a parseable Retry-After, back off by the
-  // breaker's cooloff rather than by zero. Treating a malformed header as
-  // "retry immediately" turns one rate-limit response into a hot loop.
-  defaultRetryAfter: cfg.breaker.cooloff,
-});
+const edge = process.env['HONO_TRANSPORT'] === 'true' ? createEdgeAdapter(db, cfg.dittoUrl) : null;
+const client =
+  edge?.client ??
+  createClient({
+    baseUrl: cfg.platformUrl,
+    clientId: cfg.clientId,
+    clientSecret: cfg.clientSecret,
+    requestTimeout: defaultRequestTimeout,
+    // When a 429 arrives without a parseable Retry-After, back off by the
+    // breaker's cooloff rather than by zero. Treating a malformed header as
+    // "retry immediately" turns one rate-limit response into a hot loop.
+    defaultRetryAfter: cfg.breaker.cooloff,
+  });
 const gate = createGate(cfg.vendorLimits, cfg.breaker);
 
 /*
@@ -83,7 +87,8 @@ const gate = createGate(cfg.vendorLimits, cfg.breaker);
  * what it costs.
  */
 const twin =
-  cfg.dittoUrl === ''
+  edge?.twin ??
+  (cfg.dittoUrl === ''
     ? noTwin
     : createProjector(
         createTwinStore({
@@ -92,7 +97,7 @@ const twin =
           subject: cfg.dittoSubject,
           timeout: defaultDittoTimeout,
         }),
-      );
+      ));
 const dice = rng(cfg.seed ^ 0x5f5f);
 
 const worker = {
@@ -214,8 +219,9 @@ const server = serve(cfg.port, async (req, res) => {
     // change for as long as it stays fresh. A scheduler writing a tariff plan
     // would pass 'schedule' and correctly lose to somebody at the device.
     const source = body.source === 'schedule' ? 'schedule' : 'operator';
-    await setIntent(db, intent[1]!, body.charging === true, source, now());
-    return sendJson(res, 200, { deviceId: intent[1], charging: body.charging === true, source });
+    const deviceId = decodeURIComponent(intent[1]!);
+    await setIntent(db, deviceId, body.charging === true, source, now());
+    return sendJson(res, 200, { deviceId, charging: body.charging === true, source });
   }
 
   return sendText(res, 404, 'not found');
@@ -234,6 +240,7 @@ void loop('dispatch', (at) => dispatchBatch(dispatcher, at));
 void loop('sweep', async (at) => {
   await markQuiet(db, { staleAfter: staleAfter(cfg.schedule.sweepInterval) }, at);
   await syncFleet(db, client, twin, at);
+  await edge?.ingest();
   // Always "nothing found", so the loop always pauses: the sweep is a periodic
   // job and must not spin just because it registered a device.
   return 0;

@@ -1,0 +1,58 @@
+{
+  "roles": {
+    "adapter": [
+      {
+        "resource": "registration/*",
+        "activities": ["READ", "WRITE"]
+      },
+      {
+        "resource": "credentials/*",
+        "activities": ["READ", "WRITE"]
+      },
+      {
+        "resource": "tenant",
+        "activities": ["READ", "WRITE"]
+      },
+      {
+        "resource": "cmd_router/*",
+        "activities": ["READ", "WRITE"]
+      },
+      {
+        "resource": "device_con/*",
+        "activities": ["READ", "WRITE"]
+      },
+      {
+        "operation": "registration/*:*",
+        "activities": ["EXECUTE"]
+      },
+      {
+        "operation": "credentials/*:*",
+        "activities": ["EXECUTE"]
+      },
+      {
+        "operation": "tenant/*:*",
+        "activities": ["EXECUTE"]
+      },
+      {
+        "operation": "cmd_router/*:*",
+        "activities": ["EXECUTE"]
+      },
+      {
+        "operation": "device_con/*:*",
+        "activities": ["EXECUTE"]
+      }
+    ]
+  },
+  "users": {
+    "mqtt-adapter@HONO": {
+      "mechanism": "PLAIN",
+      "password": "mqtt-secret",
+      "authorities": ["adapter"]
+    },
+    "command-router@HONO": {
+      "mechanism": "PLAIN",
+      "password": "cmd-router-secret",
+      "authorities": ["adapter"]
+    }
+  }
+}

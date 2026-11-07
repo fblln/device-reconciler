@@ -199,7 +199,7 @@ async function applyReport(q: Queryable, event: ReportEvent, now: Instant): Prom
  * fleet sync's job, and a webhook for an unknown device is either a race with
  * registration (which will resolve) or data about a device we are not managing.
  */
-async function foldClock(
+export async function foldClock(
   q: Queryable,
   deviceId: string,
   receivedAt: Instant,

@@ -363,10 +363,26 @@ units on a device. So `kanto/Dockerfile` downloads the release tarball and
 copies out the static Go binary. That is the honest cost of putting it in
 Compose, and it is why this is a profile rather than part of the default stack.
 
-What is **not** wired, and not pretended: carrying Kanto's twin into Ditto needs
-Ditto to open an `mqtt-5` connection, and Ditto's connections live in the
-`connectivity` service this compose file omits. The next step is known; the
-round trip has not been run, so the README does not say it has.
+### Eclipse Hono makes the two directions structural
+
+The optional [Hono stack](hono/README.md) connects Kanto through Hono's MQTT
+adapter and separate Kafka telemetry/event and command topics to Ditto's
+connectivity service. A second instance of the existing durable reconciler reads
+device-owned reported properties and dispatches desired properties from its
+outbox. It never treats a transport acknowledgement as actuation.
+
+```sh
+npm run hono:up
+npm run hono:test
+npm run hono:edge
+npm run hono:test:edge
+```
+
+The direct transport test checks both directions and authenticated device
+isolation. The edge test checks Kanto's local twin and reconnect synchronization,
+then requires the durable reconciler to wait on ambiguous clock evidence and
+confirm only when the device echoes its generation. See the Hono README for the
+sample contract, architecture, local ports and deliberate limits.
 
 ### Why a simulated fleet survives next to real software
 
@@ -755,12 +771,12 @@ once and never again:
 
 **What is still open.**
 
-- **The Kanto → Ditto bridge.** Kanto runs, connects to a plain local broker and
-  speaks Ditto Protocol, but nothing yet carries its twin into
-  Ditto. That needs Ditto to open an `mqtt-5`
-  [connection](https://eclipse.dev/ditto/connectivity-protocol-bindings-mqtt5.html),
-  which lives in its `connectivity` service — one of the two services this
-  compose file omits to keep `--wait` fast.
+- **The Hono path currently polls Ditto's reported properties.** It preserves
+  capture identity and device timestamps, but can coalesce intermediate events.
+  A durable northbound Kafka consumer is the upgrade for fleet-scale ingestion.
+- **The assumed-state flag is a proxy.** A clock sample or current generation
+  disables it; the stronger "ever successfully correlated" history is not yet
+  persisted. See `src/core/presentation.ts`.
 - **Mutation testing is manual.** Three mutants were planted and checked by
   hand on the paths that matter (the command-id derivation, the phase persist,
   the platform's replay counter). A `cargo mutants` equivalent for TypeScript —

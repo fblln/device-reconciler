@@ -1,0 +1,195 @@
+# Optional real device transport. Combine with compose.yaml; the default stack
+# stays small. Plaintext and fixed credentials are confined to this local lab.
+# Hono 2.6.0 is the newest published Docker Hub image, even though GitHub has 2.7.
+x-hono-env: &hono-env
+  HONO_APP_MAXINSTANCES: '1'
+  HONO_APP_AMQPMESSAGINGDISABLED: 'true'
+  # Hono's 200ms default is too short for cold Kafka topics under amd64 emulation.
+  HONO_COMMANDROUTER_REQUESTTIMEOUT: '10000'
+  HONO_REGISTRATION_REQUESTTIMEOUT: '5000'
+  HONO_TENANT_REQUESTTIMEOUT: '5000'
+  HONO_CREDENTIALS_REQUESTTIMEOUT: '5000'
+  QUARKUS_OTEL_SDK_DISABLED: 'true'
+  JAVA_OPTIONS: '-Xms64m -Xmx256m -Dhono.kafka.commonClientConfig.bootstrap.servers=hono-kafka:9092'
+x-hono-health: &hono-health
+  test: ['CMD', 'curl', '--fail', '--silent', 'http://localhost:8088/readiness']
+  interval: 5s
+  timeout: 5s
+  retries: 40
+  start_period: 30s
+services:
+  hono-kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://hono-kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@hono-kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'
+    healthcheck:
+      test: ['CMD', '/opt/kafka/bin/kafka-topics.sh', '--bootstrap-server', 'localhost:9092', '--list']
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  hono-auth:
+    image: eclipse/hono-service-auth:2.6.0
+    platform: linux/amd64
+    environment:
+      <<: *hono-env
+      HONO_AUTH_AMQP_INSECUREPORTENABLED: 'true'
+      HONO_AUTH_AMQP_INSECUREPORTBINDADDRESS: 0.0.0.0
+      HONO_AUTH_SVC_PERMISSIONSPATH: /config/permissions.json
+      HONO_AUTH_SVC_SIGNING_SHAREDSECRET: local-hono-signing-secret-at-least-32-bytes
+    volumes: ['./hono/permissions.json:/config/permissions.json:ro']
+    healthcheck: *hono-health
+
+  hono-registry:
+    image: eclipse/hono-service-device-registry-mongodb:2.6.0
+    platform: linux/amd64
+    environment:
+      <<: *hono-env
+      HONO_MONGODB_CONNECTIONSTRING: mongodb://mongodb:27017/hono
+      HONO_REGISTRY_AMQP_INSECUREPORTENABLED: 'true'
+      HONO_REGISTRY_AMQP_INSECUREPORTBINDADDRESS: 0.0.0.0
+      HONO_REGISTRY_HTTP_INSECUREPORTENABLED: 'true'
+      HONO_REGISTRY_HTTP_INSECUREPORTBINDADDRESS: 0.0.0.0
+      HONO_REGISTRY_HTTP_AUTHENTICATIONREQUIRED: 'false'
+      HONO_AUTH_HOST: hono-auth
+      HONO_AUTH_PORT: '5672'
+      HONO_AUTH_VALIDATION_SHAREDSECRET: local-hono-signing-secret-at-least-32-bytes
+    ports: ['127.0.0.1:28080:8080']
+    depends_on:
+      mongodb: { condition: service_healthy }
+      hono-auth: { condition: service_healthy }
+      hono-kafka: { condition: service_healthy }
+    healthcheck: *hono-health
+
+  hono-command-router:
+    image: eclipse/hono-service-command-router-infinispan:2.6.0
+    platform: linux/amd64
+    environment:
+      <<: *hono-env
+      HONO_COMMANDROUTER_AMQP_INSECUREPORTENABLED: 'true'
+      HONO_COMMANDROUTER_AMQP_INSECUREPORTBINDADDRESS: 0.0.0.0
+      HONO_COMMANDROUTER_CACHE_EMBEDDED_CONFIGURATIONFILE: /config/cache.xml
+      HONO_AUTH_HOST: hono-auth
+      HONO_AUTH_PORT: '5672'
+      HONO_AUTH_VALIDATION_SHAREDSECRET: local-hono-signing-secret-at-least-32-bytes
+      HONO_REGISTRATION_HOST: hono-registry
+      HONO_REGISTRATION_PORT: '5672'
+      HONO_REGISTRATION_USERNAME: command-router@HONO
+      HONO_REGISTRATION_PASSWORD: cmd-router-secret
+      HONO_TENANT_HOST: hono-registry
+      HONO_TENANT_PORT: '5672'
+      HONO_TENANT_USERNAME: command-router@HONO
+      HONO_TENANT_PASSWORD: cmd-router-secret
+    volumes: ['./hono/cache.xml:/config/cache.xml:ro']
+    depends_on:
+      hono-registry: { condition: service_healthy }
+    healthcheck: *hono-health
+
+  hono-mqtt:
+    image: eclipse/hono-adapter-mqtt:2.6.0
+    platform: linux/amd64
+    environment:
+      <<: *hono-env
+      HONO_MQTT_INSECUREPORTENABLED: 'true'
+      HONO_MQTT_INSECUREPORTBINDADDRESS: 0.0.0.0
+      HONO_REGISTRATION_HOST: hono-registry
+      HONO_REGISTRATION_PORT: '5672'
+      HONO_REGISTRATION_USERNAME: mqtt-adapter@HONO
+      HONO_REGISTRATION_PASSWORD: mqtt-secret
+      HONO_CREDENTIALS_HOST: hono-registry
+      HONO_CREDENTIALS_PORT: '5672'
+      HONO_CREDENTIALS_USERNAME: mqtt-adapter@HONO
+      HONO_CREDENTIALS_PASSWORD: mqtt-secret
+      HONO_TENANT_HOST: hono-registry
+      HONO_TENANT_PORT: '5672'
+      HONO_TENANT_USERNAME: mqtt-adapter@HONO
+      HONO_TENANT_PASSWORD: mqtt-secret
+      HONO_COMMANDROUTER_HOST: hono-command-router
+      HONO_COMMANDROUTER_PORT: '5672'
+      HONO_COMMANDROUTER_USERNAME: mqtt-adapter@HONO
+      HONO_COMMANDROUTER_PASSWORD: mqtt-secret
+    ports: ['127.0.0.1:1883:1883']
+    depends_on:
+      hono-command-router: { condition: service_healthy }
+    healthcheck: *hono-health
+
+  ditto-connectivity:
+    image: eclipse/ditto-connectivity:3.9.8
+    networks:
+      default:
+        aliases: ['ditto-cluster']
+    environment:
+      BIND_HOSTNAME: 0.0.0.0
+      MONGO_DB_HOSTNAME: mongodb
+      JAVA_TOOL_OPTIONS: '-XX:+ExitOnOutOfMemoryError -XX:MaxRAMPercentage=40 -Xss512k -Dpekko.cluster.downing-provider-class= -Dpekko.coordinated-shutdown.exit-jvm=on'
+    depends_on:
+      mongodb: { condition: service_healthy }
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', '--silent', 'http://localhost:7626/alive']
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  mosquitto:
+    ports: ['127.0.0.1:1884:1883']
+
+  kanto-edge:
+    volumes:
+      - kanto-twin:/var/lib/kanto
+    environment:
+      KANTO_HUB_ADDRESS: tcp://hono-mqtt:1883
+    depends_on:
+      hono-mqtt: { condition: service_healthy }
+
+  # Separate operational store: the simulated fleet's workers must never claim
+  # a real edge command and dispatch it to the simulated aggregator.
+  hono-postgres:
+    image: postgres:18-alpine
+    profiles: ['edge']
+    environment:
+      POSTGRES_USER: reconciler
+      POSTGRES_PASSWORD: reconciler
+      POSTGRES_DB: reconciler
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'reconciler', '-d', 'reconciler']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  hono-reconciler:
+    build: .
+    profiles: ['edge']
+    command: ['node', '/app/src/app.ts']
+    environment:
+      HONO_TRANSPORT: 'true'
+      DATABASE_URL: postgres://reconciler:reconciler@hono-postgres:5432/reconciler
+      DITTO_URL: http://ditto:8080
+      PORT: '9920'
+      HEALTHCHECK_URL: http://localhost:9920/readyz
+      COMMAND_TIMEOUT_MS: '30000'
+      SWEEP_INTERVAL_MS: '5000'
+      IDLE_PAUSE_MS: '500'
+    ports: ['127.0.0.1:9920:9920']
+    depends_on:
+      hono-postgres: { condition: service_healthy }
+      ditto: { condition: service_healthy }
+      hono-mqtt: { condition: service_healthy }
+    healthcheck:
+      test: ['CMD', 'node', '/app/src/platform/healthcheck.ts']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  kanto-twin:

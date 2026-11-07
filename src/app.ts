@@ -36,7 +36,8 @@ import { staleAfter } from './service/sweep.ts';
 import { createClient, defaultRequestTimeout } from './adapter/client.ts';
 import { createGate } from './adapter/gate.ts';
 import { connect, migrate } from './store/db.ts';
-import { listManaged, setIntent } from './store/devices.ts';
+import { setIntent, viewRows } from './store/devices.ts';
+import { describe, present } from './core/presentation.ts';
 import { reconcileBatch } from './service/worker.ts';
 import { dispatchBatch } from './service/dispatcher.ts';
 import { handleWebhook } from './service/ingest.ts';
@@ -150,8 +151,31 @@ const server = serve(cfg.port, async (req, res) => {
     }
   }
 
+  /*
+   * The view model, over HTTP, because it is the half of this design a user ever
+   * sees. A UI reading this can show `confirming start (143s left)` instead of a
+   * spinner, separate on/off buttons instead of a lying toggle for a device
+   * nothing has ever been correlatable from, and which of the three timeout
+   * faults happened instead of the word "failed". See src/core/presentation.ts.
+   *
+   * `line` is the same sentence the demo prints. It is included so an agent or a
+   * curl can read the state without re-implementing the formatting, which is the
+   * version of this that always drifts.
+   */
   if (url.pathname === '/v1/devices' && req.method === 'GET') {
-    return sendJson(res, 200, { devices: await listManaged(db) });
+    const at = now();
+    const devices = (await viewRows(db, at)).map((d) => {
+      const view = present(at, d.phase, d.obs, d.clock, d.policy, d.lastWhy);
+      return {
+        deviceId: d.deviceId,
+        vendor: d.vendor,
+        phase: d.phase.phase,
+        intent: d.stored,
+        view,
+        line: describe(view),
+      };
+    });
+    return sendJson(res, 200, { devices });
   }
 
   if (url.pathname === '/readout') return sendJson(res, 200, await buildReport(db, gate));

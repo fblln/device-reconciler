@@ -42,6 +42,7 @@ import { generation as asGeneration, type Generation } from '../core/correlate.t
 import type { CommandReport, Observation, Phase, PowerDeliveryState } from '../core/reconcile.ts';
 import type { IntentSource, StoredIntent } from '../core/override.ts';
 import { deviceInstant, instant, type Instant } from '../core/time.ts';
+import type { Policy } from '../core/presentation.ts';
 import { rows, type Queryable } from './db.ts';
 
 export type DeviceWork = Readonly<{
@@ -226,6 +227,8 @@ export type Persisted = Readonly<{
   wakeAt: Instant;
   /** Null clears it: the override has lapsed or we have re-asserted past it. */
   localChangeAt: Instant | null;
+  /** The decision's reason, kept on the row so the view model has a fault to show. */
+  why: string;
 }>;
 
 /**
@@ -237,7 +240,8 @@ export async function persist(q: Queryable, deviceId: string, next: Persisted): 
   await q.query(
     `update device
         set phase = $2, clock = $3, generation = $4, command_seq = $5,
-            wake_at = $6, local_change_at = $7, leased_until = null, updated_at_wall = now()
+            wake_at = $6, local_change_at = $7, last_why = $8,
+            leased_until = null, updated_at_wall = now()
       where device_id = $1`,
     [
       deviceId,
@@ -247,6 +251,7 @@ export async function persist(q: Queryable, deviceId: string, next: Persisted): 
       next.commandSeq,
       next.wakeAt,
       next.localChangeAt,
+      next.why,
     ],
   );
 }
@@ -334,4 +339,64 @@ export async function listManaged(
     `select device_id, vendor from device order by device_id`,
   );
   return result.map((r) => ({ deviceId: r.device_id, vendor: r.vendor }));
+}
+
+/**
+ * Every device as a view model, for the API.
+ *
+ * WHY THIS QUERY AND NOT THE WORK CLAIM
+ * -------------------------------------
+ * `claim` leases rows; this must not. A UI polling the device list has no
+ * business taking devices away from the reconciler, and a read that mutates a
+ * lease is the kind of thing that only shows up as a device that mysteriously
+ * stops converging while somebody has a dashboard open.
+ *
+ * It shares the joins with `claim` and nothing else, deliberately: the shapes
+ * look alike but they answer different questions, and factoring them together
+ * would mean one query serving both a control loop and a human, which is how a
+ * dashboard ends up able to break reconciliation.
+ */
+export type DeviceViewRow = Readonly<{
+  deviceId: string;
+  vendor: string;
+  stored: StoredIntent;
+  phase: Phase;
+  clock: ClockModel;
+  obs: Observation;
+  policy: Policy;
+  lastWhy: string | null;
+}>;
+
+export async function viewRows(q: Queryable, now: Instant): Promise<DeviceViewRow[]> {
+  const result = await rows<Row & { optimistic: boolean; last_why: string | null }>(
+    q,
+    `select d.device_id, d.vendor, d.intent_charging, d.intent_source, d.intent_set_at,
+            d.local_change_at, d.phase, d.clock, d.generation, d.command_seq,
+            d.optimistic, d.last_why,
+            o.is_reachable, o.device_time, o.received_at, o.power_delivery_state, o.observed_generation,
+            r.command_id as report_command_id, r.state as report_state, r.at as report_at
+       from device d
+       left join observation o on o.device_id = d.device_id
+       left join command_report r on r.device_id = d.device_id
+       order by d.device_id`,
+  );
+  return result.map((row) => ({
+    deviceId: row.device_id,
+    vendor: row.vendor,
+    stored: {
+      charging: row.intent_charging,
+      source: row.intent_source as IntentSource,
+      setAt: instant(Number(row.intent_set_at)),
+    },
+    phase: parsePhase(row.phase, row.device_id),
+    clock: parseClock(row.clock, row.device_id),
+    obs: observationFrom(row, now),
+    policy: { optimistic: row.optimistic },
+    lastWhy: row.last_why,
+  }));
+}
+
+/** Per-device display policy. The demo sets it to show both lies side by side. */
+export async function setOptimistic(q: Queryable, deviceId: string, optimistic: boolean): Promise<void> {
+  await q.query(`update device set optimistic = $2 where device_id = $1`, [deviceId, optimistic]);
 }

@@ -29,6 +29,17 @@
 -- reason about, and it is what lets an integration test drive the loop to an
 -- exact instant. The `_wall` columns are timestamptz and exist purely so a
 -- human reading the table with psql can see when something happened.
+-- APPLIED IDEMPOTENTLY AT BOOT
+-- ---------------------------
+-- src/app.ts runs this file on every start, which is why every statement is
+-- `if not exists`. That covers a fresh volume and a restart; it does NOT
+-- migrate an existing table when a column is added here, because
+-- `create table if not exists` is a no-op on a table that already exists.
+-- There is no deployed instance of this repository, so the dev answer is
+-- `npm run down && npm run up` (the volume is disposable) and the comment is
+-- the control. A real deployment gets ordered migration files; that is a
+-- different problem and pretending to solve it with `alter table if not
+-- exists` here would hide which of the two this repository actually does.
 -- ============================================================================
 
 create table if not exists device (
@@ -51,6 +62,21 @@ create table if not exists device (
   -- the generation we converged at, and the moment we re-assert, the generation
   -- advances and that evidence is gone forever.
   local_change_at bigint,
+
+  -- Which lie is worse for THIS device while a command is in flight: show the
+  -- target immediately, or keep showing the last confirmed state. Per device
+  -- rather than global because a fleet is mixed — showing "charging" a little
+  -- early on a charger is kind, and showing "heating" to someone who is cold is
+  -- how people stop trusting an app. Not derivable from anything, which is why
+  -- it is configuration and `assumed` next to it is derived. See
+  -- src/core/presentation.ts.
+  optimistic      boolean not null default false,
+
+  -- What the loop last decided, in words. Written on every persist, because the
+  -- view model needs a fault string a user can read and the decision log is the
+  -- wrong place to query for one device's latest line. Also the first thing
+  -- worth reading in psql when a device is not doing what you expect.
+  last_why        text,
 
   -- The Phase union and the ClockModel, stored verbatim as JSON.
   --
@@ -185,7 +211,12 @@ create table if not exists observation (
 
 create table if not exists command_report (
   device_id  text primary key references device (device_id) on delete cascade,
-  command_id uuid not null,
+  -- text, not uuid, and the same shape as outbox.command_id: a command id here
+  -- is `deviceId/seq`, derived rather than random, so a retried transaction
+  -- re-derives the same idempotency key. It is also what the report has to be
+  -- matched against, and a type mismatch between the two tables would mean the
+  -- join silently never matches.
+  command_id text not null,
   state      text not null check (state in ('PENDING', 'ACCEPTED', 'IN_PROGRESS', 'REJECTED', 'APPLIED')),
   -- On OUR clock: the command channel is stamped by us, which is why it needs
   -- no correlation at all.

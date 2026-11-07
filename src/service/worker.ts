@@ -117,6 +117,9 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
         // rather than waiting for the next sweep to notice. `least` so this never
         // pushes a nearer deadline out.
         wakeAt: earliest(nextWake(step.state, now, cfg.schedule), resolution.holdUntil),
+        // The same sentence the audit log gets, so the view model's fault
+        // string and the log never disagree about why a device is where it is.
+        why: resolution.outcome === 'assert' ? step.why : `${resolution.why}; ${step.why}`,
       });
       if (step.command !== null) await enqueue(client, device.deviceId, step.command, now);
       // The override's reasoning goes in the audit log alongside the decision's.

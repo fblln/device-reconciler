@@ -608,6 +608,49 @@ Requires Node 24+ (the image and CI run 26), which strips TypeScript natively �
 1.x, Prettier 3.x and [Testcontainers](https://node.testcontainers.org/), all
 current.
 
+### What the stack costs
+
+Measured, because "it runs locally" is a claim with a number behind it. Seven
+services, images already pulled, on a laptop:
+
+```
+cold start to all-healthy        28s   (docker compose up -d --wait)
+resident total                1.77GB
+
+ditto-things                  512MiB
+ditto-policies                470MiB
+ditto (gateway)               465MiB      three JVMs: 1.45GB, 82% of the stack
+mongodb                       108MiB
+platform (simulated fleet)     84MiB
+reconciler                     76MiB
+postgres                       53MiB
+```
+
+Two things follow, and the second is the one worth arguing about.
+
+**The JVM twin store dominates.** 82% of the memory is the three Ditto
+services, which is the price of using a real twin store rather than a fake, and
+it is why `things-search` and `connectivity` are dropped rather than kept "in
+case". Dropping Mongo is not available — Ditto's released persistence is
+MongoDB-only, and PostgreSQL support is
+[an open proposal](https://github.com/eclipse-ditto/ditto/issues/2629), not a
+shipped feature.
+
+**Consolidating onto one datastore would be a false economy.** The obvious tidy
+— Mongo is unavoidable, so make it the only datastore and drop Postgres — costs
+53MiB, 3% of the stack, and buys a rewrite of the outbox, the durable timers and
+the `for update skip locked` work claim into single-document modelling, because
+a standalone MongoDB has no multi-document transactions. Two datastores is the
+honest answer here: one is Ditto's, dictated by Ditto, and one is ours, chosen
+for the transaction the outbox needs. "Fewer moving parts" is a good instinct
+that this measurement does not support.
+
+**The fast loop needs none of it.** `npm run test:core` is 166 tests in ~0.3s
+against no containers, no network and no clock — `src/core/` has no I/O by
+construction, which is the whole reason it is a separate directory. The
+integration suite starts its own throwaway Postgres per file; only the twin
+tests and the demo want the full stack.
+
 ## Health checks are not `/dev/tcp`
 
 Every readiness probe here is either an exec-form HTTP request from the runtime

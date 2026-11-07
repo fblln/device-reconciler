@@ -1,0 +1,42 @@
+{
+  "name": "device-reconciler-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The operational half of a two-channel, two-clock desired-state reconciler for energy devices: durable in-flight state, idempotent dispatch, per-vendor backpressure and observability, against a runnable mock aggregator platform. Everything runs locally.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "up": "docker compose up -d --wait",
+    "down": "docker compose down -v",
+    "logs": "docker compose logs -f",
+    "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
+    "test:core": "node --test 'test/core/*.test.ts' test/perf.test.ts",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include='src/core/**' --test-coverage-lines=100 --test-coverage-functions=100 --test-coverage-branches=95 'test/core/*.test.ts'",
+    "test:integration": "node --test --test-concurrency=1 --test-timeout=180000 'test/integration/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src test",
+    "fmt": "prettier --write .",
+    "fmt:check": "prettier --check .",
+    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm run test:coverage && npm run test:core && npm run test:integration",
+    "demo": "node src/demo.ts",
+    "platform": "node src/platform/main.ts",
+    "reconciler": "node src/app.ts"
+  },
+  "dependencies": {
+    "pg": "^8.23.1",
+    "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/sdk-node": "^0.301.0",
+    "@opentelemetry/exporter-prometheus": "^0.301.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "oxlint": "^1.92.0",
+    "prettier": "^3.9.10",
+    "testcontainers": "^12.2.1",
+    "@testcontainers/postgresql": "^12.2.1",
+    "typescript": "^7.0.2"
+  }
+}

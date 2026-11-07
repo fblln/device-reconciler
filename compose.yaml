@@ -1,0 +1,105 @@
+# ============================================================================
+# One command brings up the whole system: `docker compose up -d --wait`
+# (or `npm run up`). Postgres, the mock aggregator platform, and the reconciler.
+# No cloud service, no credentials, no vendor account, no hardware.
+#
+# `--wait` is load-bearing for the agentic-devex requirement: it returns only
+# once every service reports HEALTHY, so a script or an agent can bring the
+# stack up and immediately start asserting without a sleep. That only works
+# because every service below has a real health check — which is also why the
+# health checks get as much comment as they do.
+# ============================================================================
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: reconciler
+      POSTGRES_PASSWORD: reconciler
+      POSTGRES_DB: reconciler
+    ports: ['5432:5432']
+    # `pg_isready` ships in the image, speaks the Postgres protocol, and opens no
+    # socket from a shell. It is the probe to reach for here precisely because it
+    # proves readiness rather than listening: the server accepts connections AND
+    # answers. The alternative people reach for in a stripped image is
+    # `bash -c '< /dev/tcp/...'`, which is indistinguishable from a reverse shell
+    # to a runtime sensor — see the note in the Dockerfile. Where no such tool
+    # exists, the next best probe is a /proc/net/tcp grep in exec form, because
+    # reading a file is not opening a socket.
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'reconciler', '-d', 'reconciler']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  platform:
+    build: .
+    command: ['node', '/app/src/platform/main.ts']
+    environment:
+      PORT: '9900'
+      # The simulated fleet is a pure function of SEED: same seed, same clock
+      # skews, latencies and pathologies. An integration failure is replayable.
+      SEED: '20261107'
+      FLEET_SIZE: '24'
+      # The compressed timeline. Real feeds run on minutes; this runs on
+      # seconds so the fleet converges while someone is watching. The RATIOS
+      # between capture interval, latency and actuation delay are preserved —
+      # see the note in src/platform/sim.ts.
+      TICK_MS: '1000'
+      CLIENT_ID: reconciler
+      CLIENT_SECRET: dev-client-secret
+      WEBHOOK_SECRET: dev-webhook-secret
+      # Service name, not localhost: a webhook posted to localhost from inside a
+      # container reaches that container and nothing is ever delivered.
+      WEBHOOK_URL: http://reconciler:9910/webhooks
+    ports: ['9900:9900']
+    healthcheck:
+      test: ['CMD', 'node', '/app/src/platform/healthcheck.ts']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  reconciler:
+    build: .
+    command: ['node', '/app/src/app.ts']
+    depends_on:
+      postgres: { condition: service_healthy }
+      # Not service_healthy: the reconciler retries the platform on its own
+      # (that is what the breaker and the backoff are for), so making it wait
+      # here would only hide whether that retry path works.
+      platform: { condition: service_started }
+    environment:
+      DATABASE_URL: postgres://reconciler:reconciler@postgres:5432/reconciler
+      PLATFORM_URL: http://platform:9900
+      PLATFORM_CLIENT_ID: reconciler
+      PLATFORM_CLIENT_SECRET: dev-client-secret
+      WEBHOOK_SECRET: dev-webhook-secret
+      PORT: '9910'
+      PUBLIC_URL: http://reconciler:9910
+      # Scaled to the platform's compressed timeline: a command timeout of three
+      # real minutes against a four-second capture interval would never fire, and
+      # the timeout path is one of the things worth watching.
+      COMMAND_TIMEOUT_MS: '20000'
+      SKEW_BOUND_MS: '2000'
+      MAX_LATENCY_MS: '4000'
+      SWEEP_INTERVAL_MS: '5000'
+      FAILED_INTERVAL_MS: '60000'
+      VENDOR_RPS: '5'
+      VENDOR_BURST: '10'
+      SEED: '20261107'
+      # The shared health-check script reads this; without it the script would
+      # probe the platform's default port from inside the reconciler container.
+      HEALTHCHECK_URL: http://127.0.0.1:9910/readyz
+    ports:
+      - '9910:9910'
+      # The Prometheus endpoint. A pull exporter needs nothing on the other end,
+      # which is why this repository has no collector: curl is a sufficient
+      # backend. See src/telemetry.ts.
+      - '9911:9911'
+    healthcheck:
+      test: ['CMD', 'node', '/app/src/platform/healthcheck.ts']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      # The reconciler's own port, not the platform's.
+      start_period: 5s

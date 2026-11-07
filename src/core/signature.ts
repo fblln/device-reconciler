@@ -89,9 +89,24 @@ export function verify(
   }
 
   const t = parts.get('t');
-  if (t === undefined) return { ok: false, reason: 'malformed-header' };
+  /*
+   * Digits only, deliberately, rather than `Number.isFinite(Number(t))`.
+   *
+   * Found by test/core/signature.test.ts, not by review. `Number('')` is 0, so
+   * a header carrying `t=` with no value parsed as "signed at the epoch",
+   * sailed past the freshness check on any generous tolerance, and was only
+   * stopped by the MAC — reported as `bad-signature`. Not exploitable, because
+   * forging a digest for t=0 still needs the secret, but wrong in two ways that
+   * matter: the metric blamed a forgery attempt for what was a malformed
+   * request, and the freshness window — the cheap check that is supposed to
+   * reject a flood of replays before any HMAC is computed — was bypassed by the
+   * one input shape that trivially triggers it.
+   *
+   * A regex also rejects `0x10`, `1e3`, ` 12 ` and `Infinity`, none of which is
+   * a timestamp any signer sends, and all of which `Number` accepts.
+   */
+  if (t === undefined || !/^\d+$/.test(t)) return { ok: false, reason: 'malformed-header' };
   const signedAt = Number(t);
-  if (!Number.isFinite(signedAt)) return { ok: false, reason: 'malformed-header' };
 
   const provided = parts.get('v1');
   if (provided === undefined) return { ok: false, reason: 'unknown-version' };

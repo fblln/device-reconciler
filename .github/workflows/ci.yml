@@ -1,0 +1,112 @@
+# ============================================================================
+# CI — the gates, in the order that fails fastest.
+#
+# WHY TWO JOBS AND NOT ONE
+# ------------------------
+# The pure half of this repository is fast: typecheck, lint, format, 166 tests
+# and a 100% coverage gate run in a few seconds with nothing installed but
+# devDependencies. The operational half needs Docker, a Postgres container per
+# test file and — for the twin tests — five containers and a Pekko cluster that
+# takes most of a minute to converge.
+#
+# Splitting them means a typo in a test is reported in under a minute instead of
+# after the slow job, and a flake in the slow job cannot be confused for a
+# failure in the fast one. The fast job is also the one a developer runs locally
+# as `npm run check`.
+#
+# NO BUILD STEP ANYWHERE
+# ----------------------
+# Node strips TypeScript natively, so `src/**.ts` is the artifact. There is
+# nothing to compile, no dist/ to cache and no bundler to configure. `tsc` runs
+# only as a typechecker, which is why `--noEmit` is not a compromise here.
+# ============================================================================
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer worthless, and a
+# queue of superseded integration runs is how a Docker-based suite becomes the
+# slowest thing in the project.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck, lint, unit, coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # The engines field says >=24; CI runs the version the Dockerfile runs,
+          # because "works on my Node" is the one portability claim this
+          # repository makes and it should be tested on the Node it ships with.
+          node-version: '26'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run fmt:check
+      # The coverage gate is the assertion: 100% lines and functions over
+      # src/core/**, which fails the build rather than printing a number nobody
+      # reads.
+      - run: npm run test:coverage
+      # Unit plus the property suite plus the throughput floor. The floor is an
+      # order of magnitude below a laptop precisely so a shared runner cannot
+      # flake it while a real regression still fails it.
+      - run: npm run test:core
+
+  integration:
+    name: integration against Postgres and Ditto
+    runs-on: ubuntu-latest
+    # Generous, because the Ditto cluster's convergence dominates it and a
+    # timeout tuned to the happy path is a flake waiting for a slow runner.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+      - run: npm ci
+
+      # Postgres comes from Testcontainers, per test file, on an ephemeral port
+      # — not from a service container. A shared database would let one test
+      # file's rows leak into another's assertions, and the first failing run
+      # would leave a dirty volume that makes every later run a liar.
+      #
+      # Ditto is the exception: four JVM containers forming a Pekko cluster is
+      # too slow to start per file, so it comes from the compose file, once.
+      # `--wait` returns only when every service reports healthy, which is what
+      # lets the next step start asserting with no sleep.
+      - name: bring up the twin store
+        run: docker compose up -d --wait mongodb ditto-policies ditto-things ditto
+
+      - name: integration tests
+        env:
+          # Without this the twin tests skip themselves by name. In CI they must
+          # actually run — a suite whose most interesting tests are skipped on
+          # the machine that gates merges is not gating anything.
+          DITTO_URL: http://localhost:8080
+        run: npm run test:integration
+
+      # The acceptance criterion, as a test rather than as a claim in a README:
+      # one command brings the whole thing up, and the readout is produced by a
+      # running fleet.
+      - name: the whole stack, and a readout from it
+        run: |
+          docker compose up -d --wait
+          DEMO_SECONDS=30 npm run demo
+
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: tear down
+        if: always()
+        run: docker compose down -v

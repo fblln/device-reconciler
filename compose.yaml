@@ -185,6 +185,93 @@ services:
       retries: 40
       start_period: 20s
 
+  # --------------------------------------------------------------------------
+  # THE EDGE TIER: Eclipse Kanto. OPT-IN, via `docker compose --profile edge up`.
+  #
+  # Kanto is the on-device half of this architecture: it runs on a device or
+  # gateway and keeps a LOCAL digital twin that works offline, synchronising in
+  # both directions when the link comes back — the cloud sets desired
+  # properties, the edge reports features and values. That is exactly the twin
+  # semantics this repository is about, at the other end of the wire.
+  #
+  # WHAT IS VERIFIED, by running it: the two containers below start, Kanto's
+  # local-digital-twins connects to a plain `tcp://` broker with no TLS, no
+  # Eclipse Hono and no AWS, and it subscribes and publishes on Hono's MQTT
+  # topics (`e/#`, `t/#`, `command//+/req/#`, `edge/thing/request`) carrying
+  # ECLIPSE DITTO PROTOCOL envelopes — its go.mod requires
+  # `eclipse/ditto-clients-golang` and it implements Ditto's topic criteria.
+  # So the protocol match with the cloud twin is real, not hoped for.
+  #
+  # WHAT IS NOT WIRED, and why it is not pretended: bridging this broker to the
+  # Ditto instance above needs Ditto to open an `mqtt-5` CONNECTION, and Ditto's
+  # connections live in its `connectivity` service — one of the two services
+  # this compose file deliberately omits to keep `--wait` fast. Adding it back
+  # is the next step and it is a known quantity; claiming the round trip works
+  # before running it would not be.
+  #
+  # Kanto publishes no container image at all (releases are .deb/.rpm/.tar.gz
+  # for linux x86_64/arm64/armv7, built to be installed as systemd units on a
+  # device), so kanto/Dockerfile downloads the release tarball and copies out
+  # the static Go binary. That is the honest cost of putting it in Compose.
+  #
+  # WHY THE SIMULATED FLEET STAYS. Kanto gives realism; it does not give
+  # controllable failure injection. Clock skew of ten minutes, telemetry
+  # delivered out of order, a duplicate webhook, a device that acknowledges and
+  # never applies, half a fleet that reports a counter and half that does not —
+  # none of that can be asked of real software on demand, and all of it is the
+  # pathology matrix the tests are worth running for. So: a deterministic
+  # simulator for the matrix, real software pointed at once to show the
+  # integration is not fiction. The sibling repository documents the same split.
+  # --------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2.1.2-alpine
+    profiles: ['edge']
+    volumes:
+      - ./kanto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      # A /proc/net/tcp grep in EXEC form, because this image ships neither curl
+      # nor an HTTP endpoint to curl — the broker speaks MQTT, not HTTP. 075B is
+      # 1883 in hex and 0A is the listening state; `0*:0000` matches a remote
+      # address of any padding.
+      #
+      # Reading a file is not opening a socket. The conventional answer for an
+      # image with no HTTP client is `bash -c '< /dev/tcp/127.0.0.1/1883'`, and
+      # that is byte-for-byte the construct every reverse-shell detection rule
+      # in the industry is written against — a process wiring one of its own
+      # standard streams to a network connection. It raises a High-severity
+      # finding on a monitored CI runner and a sensor cannot tell it from an
+      # intrusion, because the only difference is the destination. See the
+      # Dockerfile, and "The Health Check Was a Reverse Shell" on fblln.github.io.
+      test: ['CMD', 'grep', '-q', ':075B 0*:0000 0A', '/proc/net/tcp']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  kanto-edge:
+    build: ./kanto
+    profiles: ['edge']
+    depends_on:
+      mosquitto: { condition: service_healthy }
+    entrypoint: ['/run.sh']
+    volumes:
+      - ./kanto/run.sh:/run.sh:ro
+    environment:
+      # Two broker addresses, one broker. In a real deployment the local broker
+      # is on the device and the hub is elsewhere; here they are the same
+      # Mosquitto, separated by topic. Plain tcp:// on purpose — Kanto only
+      # demands a CA certificate when the scheme is a secure one, which is what
+      # makes a fully local, credential-free edge tier possible at all.
+      KANTO_HUB_ADDRESS: tcp://mosquitto:1883
+      KANTO_LOCAL_ADDRESS: tcp://mosquitto:1883
+      KANTO_TENANT: energy
+      # namespace:name, because a Ditto thing id is exactly that and Kanto's
+      # twin is addressed by the same identifier the cloud twin uses.
+      KANTO_DEVICE_ID: energy:edge-0001
+      KANTO_AUTH_ID: edge_0001
+      KANTO_PASSWORD: secret
+      KANTO_POLICY_ID: energy:edge-0001
+      KANTO_LOG_LEVEL: INFO
+
   platform:
     build: .
     command: ['node', '/app/src/platform/main.ts']

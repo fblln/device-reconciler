@@ -12,6 +12,13 @@
  * finished: its invariants are pinned by contracts and property tests that came
  * across with it.
  *
+ * Re-port procedure, because a vendored copy that nobody knows how to refresh
+ * is a fork: copy the file from the sibling, re-apply this banner, and re-apply
+ * the two additions marked ADDED HERE (Step.correlation in reconcile.ts and
+ * contract I9 in contracts.ts). Nothing else in these five files may be edited
+ * locally; a change belongs upstream, in the sibling, where the property tests
+ * that pin it live.
+ *
  * Everything below this banner is the pure, deterministic, clock-free half of
  * the system. Nothing in src/core may import from src/store, src/adapter,
  * src/platform or src/service. That rule is what keeps the hard part testable
@@ -177,15 +184,15 @@ export function checkStep(input: Input, step: Step): void {
   assert.ok(next.since <= now, 'I6 violated: next phase dated in the future');
 
   /*
-   * I9. A reported correlation agrees with the device's own report about whether
-   * it counts. The strategy choice is a one-line conditional in correlate.ts and
-   * it is the most consequential line in the system: taking the clock fallback
-   * on a device that echoes a generation throws away exactness for no reason,
-   * and claiming a generation for a device that reports none is a confident
-   * answer derived from nothing. Asserted on every decision, so a mutant that
-   * inverts that conditional cannot survive — which matters more here than in
-   * the sibling repo, because the readout this repository exists to produce
-   * reports the fallback rate as a fact about the fleet.
+   * I9. ADDED HERE. A reported correlation agrees with the device's own report
+   * about whether it counts. The strategy choice is a one-line conditional in
+   * correlate.ts and it is the most consequential line in the system: taking the
+   * clock fallback on a device that echoes a generation throws away exactness
+   * for no reason, and claiming a generation for a device that reports none is a
+   * confident answer derived from nothing. Asserted on every decision, so a
+   * mutant that inverts that conditional cannot survive — which matters more
+   * here than in the sibling repo, because the readout this repository exists to
+   * produce reports the fallback rate as a fact about the fleet.
    */
   if (step.correlation !== null) {
     assert.equal(

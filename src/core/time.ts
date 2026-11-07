@@ -12,6 +12,13 @@
  * finished: its invariants are pinned by contracts and property tests that came
  * across with it.
  *
+ * Re-port procedure, because a vendored copy that nobody knows how to refresh
+ * is a fork: copy the file from the sibling, re-apply this banner, and re-apply
+ * the two additions marked ADDED HERE (Step.correlation in reconcile.ts and
+ * contract I9 in contracts.ts). Nothing else in these five files may be edited
+ * locally; a change belongs upstream, in the sibling, where the property tests
+ * that pin it live.
+ *
  * Everything below this banner is the pure, deterministic, clock-free half of
  * the system. Nothing in src/core may import from src/store, src/adapter,
  * src/platform or src/service. That rule is what keeps the hard part testable

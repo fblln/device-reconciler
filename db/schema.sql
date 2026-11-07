@@ -36,8 +36,21 @@ create table if not exists device (
   vendor          text not null,
 
   -- Desired state. One boolean, as in the sibling repo: the interesting part is
-  -- the correlation, not the schema.
+  -- the correlation, not the schema. What IS richer than the sibling is where
+  -- the intent came from, because that is what decides who wins when a human at
+  -- the device disagrees with a schedule. See src/core/override.ts for why
+  -- precedence is first-class here rather than retrofitted: a loop that
+  -- re-asserts unconditionally is painful to teach manners to later.
   intent_charging boolean not null default false,
+  intent_source   text not null default 'schedule'
+                    check (intent_source in ('schedule', 'local', 'operator')),
+  intent_set_at   bigint not null default 0,
+
+  -- When a third party was last observed to have moved this device. Persisted
+  -- because it CANNOT be re-derived: the evidence is the device still reporting
+  -- the generation we converged at, and the moment we re-assert, the generation
+  -- advances and that evidence is gone forever.
+  local_change_at bigint,
 
   -- The Phase union and the ClockModel, stored verbatim as JSON.
   --
@@ -173,7 +186,7 @@ create table if not exists observation (
 create table if not exists command_report (
   device_id  text primary key references device (device_id) on delete cascade,
   command_id uuid not null,
-  state      text not null check (state in ('PENDING', 'ACCEPTED', 'REJECTED', 'APPLIED')),
+  state      text not null check (state in ('PENDING', 'ACCEPTED', 'IN_PROGRESS', 'REJECTED', 'APPLIED')),
   -- On OUR clock: the command channel is stamped by us, which is why it needs
   -- no correlation at all.
   at         bigint not null

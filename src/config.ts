@@ -22,6 +22,7 @@ import { duration, type Duration } from './core/time.ts';
 import type { BackoffConfig } from './core/backoff.ts';
 import type { BreakerConfig } from './core/breaker.ts';
 import type { Limits } from './core/ratelimit.ts';
+import type { OverrideConfig } from './core/override.ts';
 import type { ScheduleConfig } from './core/schedule.ts';
 
 const str = (name: string, fallback: string): string => process.env[name] ?? fallback;
@@ -50,6 +51,7 @@ export type Config = Readonly<{
   skewBound: Duration;
   maxLatency: Duration;
   schedule: ScheduleConfig;
+  override: OverrideConfig;
   backoff: BackoffConfig;
   breaker: BreakerConfig;
   vendorLimits: Limits;
@@ -98,6 +100,14 @@ export function loadConfig(): Config {
     schedule: {
       sweepInterval: ms('SWEEP_INTERVAL_MS', 30_000),
       failedInterval: ms('FAILED_INTERVAL_MS', 10 * 60_000),
+    },
+    // Who wins when a human at the device disagrees with a schedule. Both of
+    // these are product decisions wearing technical clothes: fifteen minutes of
+    // deference is right for a charger on a half-hourly tariff and far too short
+    // for someone who has just turned the heating up. See src/core/override.ts.
+    override: {
+      localHold: ms('LOCAL_HOLD_MS', 15 * 60_000),
+      operatorFreshness: ms('OPERATOR_FRESHNESS_MS', 5 * 60_000),
     },
     backoff: {
       base: ms('BACKOFF_BASE_MS', 1_000),

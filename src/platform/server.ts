@@ -57,7 +57,10 @@ export type PlatformOptions = Readonly<{
 type Commanded = {
   commandId: string;
   deviceId: string;
+  /** The client's own desired-state counter, round-tripped back in telemetry. */
   generation: number;
+  /** The version this platform minted for the command. Azure's `$version`. */
+  av: number;
   target: boolean;
   state: CommandReportState;
   at: number;
@@ -82,6 +85,8 @@ export type PlatformStats = Readonly<{
   webhooksSent: number;
   webhooksFailed: number;
   webhooksDuplicated: number;
+  /** Events discarded because no webhook URL is configured. Never "sent". */
+  webhooksDropped: number;
 }>;
 
 export type Platform = Readonly<{
@@ -130,6 +135,7 @@ export function startPlatform(opts: PlatformOptions): Platform {
     webhooksSent: 0,
     webhooksFailed: 0,
     webhooksDuplicated: 0,
+    webhooksDropped: 0,
   };
 
   /** Bearer tokens. A random string and an expiry is all the client exercises. */
@@ -163,8 +169,17 @@ export function startPlatform(opts: PlatformOptions): Platform {
     }
   }
 
+  /**
+   * Returns whether the delivery is finished with. With no webhook URL
+   * configured the event is DROPPED rather than counted as sent: a repository
+   * whose point is honest measurement must not have a counter that reports
+   * deliveries it never attempted.
+   */
   async function deliver(d: Delivery): Promise<boolean> {
-    if (opts.webhookUrl === '') return true;
+    if (opts.webhookUrl === '') {
+      counters.webhooksDropped += 1;
+      return true;
+    }
     const signedAt = instant(now());
     try {
       const res = await fetch(opts.webhookUrl, {
@@ -231,6 +246,7 @@ export function startPlatform(opts: PlatformOptions): Platform {
           deviceTime: c.deviceTime,
           powerDeliveryState: c.powerDeliveryState,
           observedGeneration: c.observedGeneration,
+          av: c.acknowledgedVersion,
         },
         device.profile.duplicatesWebhooks && r() < 0.3,
       );
@@ -239,10 +255,11 @@ export function startPlatform(opts: PlatformOptions): Platform {
     const due = deliveries.filter((d) => d.at <= t).slice(0, 64);
     await Promise.all(
       due.map(async (d) => {
+        const before = counters.webhooksDropped;
         const ok = await deliver(d);
         const at = deliveries.indexOf(d);
         if (ok) {
-          counters.webhooksSent += 1;
+          if (counters.webhooksDropped === before) counters.webhooksSent += 1;
           if (at >= 0) deliveries.splice(at, 1);
           return;
         }
@@ -356,22 +373,62 @@ export function startPlatform(opts: PlatformOptions): Platform {
 
       const payload = JSON.parse(await readBody(req)) as { target: boolean; generation: number };
       const t = now();
-      const state = accept(device, idempotencyKey, payload.generation, payload.target, t);
+      const ack = accept(device, idempotencyKey, payload.generation, payload.target, t);
       const record: Commanded = {
         commandId: idempotencyKey,
         deviceId,
         generation: payload.generation,
+        av: ack.av,
         target: payload.target,
-        state,
+        state: ack.state,
         at: t,
       };
       commands.set(idempotencyKey, record);
       counters.commands += 1;
-      const body = { commandId: idempotencyKey, state, at: t };
+      /*
+       * THE RESPONSE SHAPE IS AZURE IoT PLUG AND PLAY'S, and the two counters in
+       * it are not redundant.
+       *
+       *   av   the version THIS PLATFORM minted for the desired state, at its own
+       *        serialisation point. Monotonic per device, never reused, assigned
+       *        before the device is consulted — the same role as Azure's
+       *        `$version` and Kubernetes' `metadata.generation`. A client must
+       *        never invent this, and this one does not: it is read from the
+       *        response, never sent in the request.
+       *   generation
+       *        the CLIENT's own desired-state counter, round-tripped unchanged.
+       *        This is the role of AWS IoT's `clientToken`: it ties what comes
+       *        back to the request that caused it, in a namespace the client can
+       *        compare against its own records.
+       *
+       * Both exist because correlation needs a counter the CLIENT can compare,
+       * and `av` is not one until the client has seen the acknowledgement — which
+       * is strictly after it has already committed a phase saying a command is in
+       * flight. Round-tripping the client's counter is what lets correlation stay
+       * exact from the first telemetry snapshot instead of falling back to clock
+       * bounds for one whole capture interval after every command. A platform
+       * that offered only `av` would force exactly that fallback, and the
+       * reconciler handles it — see the note on the generation in
+       * src/core/identity.ts.
+       */
+      const body = { commandId: idempotencyKey, state: ack.state, av: ack.av, ac: ack.ac, ad: ack.ad, at: t };
       idempotency.set(idempotencyKey, { status: 202, body });
       // The acknowledgement also arrives on the webhook channel, because a
       // reconciler must not have to poll to learn a command was rejected.
-      enqueue(randomUUID(), t, { kind: 'report', deviceId, commandId: idempotencyKey, state, at: t }, false);
+      enqueue(
+        randomUUID(),
+        t,
+        {
+          kind: 'report',
+          deviceId,
+          commandId: idempotencyKey,
+          state: ack.state,
+          ac: ack.ac,
+          av: ack.av,
+          at: t,
+        },
+        false,
+      );
       return sendJson(res, 202, body);
     }
 
@@ -380,7 +437,7 @@ export function startPlatform(opts: PlatformOptions): Platform {
       const found = commands.get(report[1]!);
       return found === undefined
         ? sendJson(res, 404, { error: 'no such command' })
-        : sendJson(res, 200, { commandId: found.commandId, state: found.state, at: found.at });
+        : sendJson(res, 200, { commandId: found.commandId, state: found.state, av: found.av, at: found.at });
     }
 
     return sendText(res, 404, 'not found');

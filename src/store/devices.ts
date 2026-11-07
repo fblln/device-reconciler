@@ -39,14 +39,18 @@
 
 import type { ClockModel } from '../core/clock.ts';
 import { generation as asGeneration, type Generation } from '../core/correlate.ts';
-import type { CommandReport, Intent, Observation, Phase, PowerDeliveryState } from '../core/reconcile.ts';
+import type { CommandReport, Observation, Phase, PowerDeliveryState } from '../core/reconcile.ts';
+import type { IntentSource, StoredIntent } from '../core/override.ts';
 import { deviceInstant, instant, type Instant } from '../core/time.ts';
 import { rows, type Queryable } from './db.ts';
 
 export type DeviceWork = Readonly<{
   deviceId: string;
   vendor: string;
-  intent: Intent;
+  /** Desired state WITH its provenance, because precedence needs the source. */
+  stored: StoredIntent;
+  /** When a third party was last seen to move this device. See core/override.ts. */
+  localChangeAt: Instant | null;
   phase: Phase;
   clock: ClockModel;
   /** The highest generation already handed out for this device. */
@@ -61,6 +65,9 @@ type Row = {
   device_id: string;
   vendor: string;
   intent_charging: boolean;
+  intent_source: string;
+  intent_set_at: string;
+  local_change_at: string | null;
   phase: unknown;
   clock: unknown;
   generation: string;
@@ -183,7 +190,8 @@ export async function claim(
          from due where d.device_id = due.device_id
        returning d.*
      )
-     select l.device_id, l.vendor, l.intent_charging, l.phase, l.clock, l.generation, l.command_seq,
+     select l.device_id, l.vendor, l.intent_charging, l.intent_source, l.intent_set_at,
+            l.local_change_at, l.phase, l.clock, l.generation, l.command_seq,
             o.is_reachable, o.device_time, o.received_at, o.power_delivery_state, o.observed_generation,
             r.command_id as report_command_id, r.state as report_state, r.at as report_at
        from leased l
@@ -195,7 +203,12 @@ export async function claim(
   return result.map((row) => ({
     deviceId: row.device_id,
     vendor: row.vendor,
-    intent: { charging: row.intent_charging },
+    stored: {
+      charging: row.intent_charging,
+      source: row.intent_source as IntentSource,
+      setAt: instant(Number(row.intent_set_at)),
+    },
+    localChangeAt: row.local_change_at === null ? null : instant(Number(row.local_change_at)),
     phase: parsePhase(row.phase, row.device_id),
     clock: parseClock(row.clock, row.device_id),
     generation: asGeneration(Number(row.generation)),
@@ -211,6 +224,8 @@ export type Persisted = Readonly<{
   generation: Generation;
   commandSeq: number;
   wakeAt: Instant;
+  /** Null clears it: the override has lapsed or we have re-asserted past it. */
+  localChangeAt: Instant | null;
 }>;
 
 /**
@@ -222,7 +237,7 @@ export async function persist(q: Queryable, deviceId: string, next: Persisted): 
   await q.query(
     `update device
         set phase = $2, clock = $3, generation = $4, command_seq = $5,
-            wake_at = $6, leased_until = null, updated_at_wall = now()
+            wake_at = $6, local_change_at = $7, leased_until = null, updated_at_wall = now()
       where device_id = $1`,
     [
       deviceId,
@@ -231,6 +246,7 @@ export async function persist(q: Queryable, deviceId: string, next: Persisted): 
       next.generation,
       next.commandSeq,
       next.wakeAt,
+      next.localChangeAt,
     ],
   );
 }
@@ -274,13 +290,19 @@ export async function setIntent(
   q: Queryable,
   deviceId: string,
   charging: boolean,
+  source: IntentSource,
   now: Instant,
 ): Promise<void> {
-  await q.query(`update device set intent_charging = $2, wake_at = least(wake_at, $3) where device_id = $1`, [
-    deviceId,
-    charging,
-    now,
-  ]);
+  // Setting an intent also clears any local override. An explicit request is a
+  // deliberate answer to the question the override was raising, so continuing to
+  // hold against it would mean the operator's decision had no effect — which is
+  // how people learn to distrust a control plane and start pulling breakers.
+  await q.query(
+    `update device set intent_charging = $2, intent_source = $3, intent_set_at = $4,
+            local_change_at = null, wake_at = least(wake_at, $4)
+      where device_id = $1`,
+    [deviceId, charging, source, now],
+  );
 }
 
 /**

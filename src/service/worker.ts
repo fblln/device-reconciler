@@ -35,6 +35,8 @@
  */
 
 import { reconcileChecked } from '../core/contracts.ts';
+import { movedByOther, resolve, type OverrideConfig } from '../core/override.ts';
+import { observedCharging } from '../core/reconcile.ts';
 import { mint } from '../core/identity.ts';
 import { nextWake, type ScheduleConfig } from '../core/schedule.ts';
 import type { Bounds } from '../core/clock.ts';
@@ -47,6 +49,7 @@ import { mapWithLimit } from './queue.ts';
 import { log, type Instruments } from '../telemetry.ts';
 
 export type WorkerConfig = Readonly<{
+  override: OverrideConfig;
   commandTimeout: Duration;
   bounds: Bounds;
   schedule: ScheduleConfig;
@@ -65,9 +68,28 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
 
   const settled = await mapWithLimit(batch, cfg.concurrency, async (device) => {
     const started = performance.now();
+
+    /*
+     * PRECEDENCE FIRST, DECISION SECOND.
+     *
+     * The decision function has no opinion about where an intent came from, and
+     * should not — mixing "what do I want" with "did I get it" is how a control
+     * loop becomes untestable. So the effective intent is resolved here and
+     * handed over as data (src/core/override.ts).
+     *
+     * The third-party signal is checked BEFORE reconciling, because reconciling
+     * destroys it: the evidence is the device still reporting the generation we
+     * converged at, and the moment we issue a command the generation advances
+     * and that evidence is gone. Once observed it is persisted, so the hold
+     * window survives restarts and the device is not re-asserted at the first
+     * wake after a deploy.
+     */
+    const localChangeAt = movedByOther(device.phase, device.obs) ? now : device.localChangeAt;
+    const resolution = resolve(device.stored, localChangeAt, observedCharging(device.obs), now, cfg.override);
+
     const step = reconcileChecked({
       now,
-      intent: device.intent,
+      intent: resolution.intent,
       obs: device.obs,
       report: device.report,
       clock: device.clock,
@@ -80,6 +102,10 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
       await persist(client, device.deviceId, {
         phase: step.state,
         clock: device.clock,
+        // Cleared once the hold lapses, so the row does not keep a stale
+        // override around forever and a later genuine local change is not read
+        // as a continuation of one from last week.
+        localChangeAt: resolution.outcome === 'assert' ? null : localChangeAt,
         // Only advance the counters when a command was actually minted.
         // Advancing them on every wake would burn generations, and a generation
         // the device never sees is a generation it can never echo — the
@@ -87,13 +113,38 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
         // look stuck forever.
         generation: step.command?.generation ?? device.generation,
         commandSeq: step.command === null ? device.commandSeq : device.commandSeq + 1,
-        wakeAt: nextWake(step.state, now, cfg.schedule),
+        // A hold has to end on its own, so the device is woken when it expires
+        // rather than waiting for the next sweep to notice. `least` so this never
+        // pushes a nearer deadline out.
+        wakeAt: earliest(nextWake(step.state, now, cfg.schedule), resolution.holdUntil),
       });
       if (step.command !== null) await enqueue(client, device.deviceId, step.command, now);
-      await record(client, device.deviceId, device.vendor, now, step);
+      // The override's reasoning goes in the audit log alongside the decision's.
+      // A device that is deliberately not being asserted looks identical to one
+      // that is stuck unless the log says which.
+      await record(
+        client,
+        device.deviceId,
+        device.vendor,
+        now,
+        resolution.outcome === 'assert' ? step : { ...step, why: `${resolution.why}; ${step.why}` },
+      );
     });
 
-    instruments.decisions.add(1, { phase: step.state.phase, vendor: device.vendor });
+    instruments.decisions.add(1, {
+      phase: step.state.phase,
+      vendor: device.vendor,
+      override: resolution.outcome,
+    });
+    if (resolution.outcome === 'conflict') {
+      // An alert, not a statistic: two deliberate writers disagree and the
+      // resolution is a human decision. A hold is routine and stays a counter.
+      log('override.conflict', {
+        deviceId: device.deviceId,
+        storedSource: device.stored.source,
+        why: resolution.why,
+      });
+    }
     if (step.correlation !== null) {
       instruments.correlations.add(1, {
         outcome: step.correlation.correlation,
@@ -116,3 +167,6 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
   }
   return batch.length;
 }
+
+/** The nearer of two wake instants, ignoring a null. */
+const earliest = (a: Instant, b: Instant | null): Instant => (b !== null && b < a ? b : a);

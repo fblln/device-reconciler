@@ -74,6 +74,7 @@ const worker = {
   db,
   instruments,
   cfg: {
+    override: cfg.override,
     commandTimeout: cfg.commandTimeout,
     bounds: { skewBound: cfg.skewBound, maxLatency: cfg.maxLatency },
     schedule: cfg.schedule,
@@ -158,9 +159,14 @@ const server = serve(cfg.port, async (req, res) => {
 
   const intent = /^\/v1\/devices\/([^/]+)\/intent$/.exec(url.pathname);
   if (intent !== null && req.method === 'PUT') {
-    const body = JSON.parse(await readBody(req)) as { charging: boolean };
-    await setIntent(db, intent[1]!, body.charging === true, now());
-    return sendJson(res, 200, { deviceId: intent[1], charging: body.charging === true });
+    const body = JSON.parse(await readBody(req)) as { charging: boolean; source?: string };
+    // Everything arriving through our API is an 'operator' intent: explicit,
+    // attributable and recent, which is what gives it precedence over a local
+    // change for as long as it stays fresh. A scheduler writing a tariff plan
+    // would pass 'schedule' and correctly lose to somebody at the device.
+    const source = body.source === 'schedule' ? 'schedule' : 'operator';
+    await setIntent(db, intent[1]!, body.charging === true, source, now());
+    return sendJson(res, 200, { deviceId: intent[1], charging: body.charging === true, source });
   }
 
   return sendText(res, 404, 'not found');

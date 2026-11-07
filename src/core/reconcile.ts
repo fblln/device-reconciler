@@ -12,6 +12,13 @@
  * finished: its invariants are pinned by contracts and property tests that came
  * across with it.
  *
+ * Re-port procedure, because a vendored copy that nobody knows how to refresh
+ * is a fork: copy the file from the sibling, re-apply this banner, and re-apply
+ * the two additions marked ADDED HERE (Step.correlation in reconcile.ts and
+ * contract I9 in contracts.ts). Nothing else in these five files may be edited
+ * locally; a change belongs upstream, in the sibling, where the property tests
+ * that pin it live.
+ *
  * Everything below this banner is the pure, deterministic, clock-free half of
  * the system. Nothing in src/core may import from src/store, src/adapter,
  * src/platform or src/service. That rule is what keeps the hard part testable
@@ -123,14 +130,30 @@ export type Observation = Readonly<{
  * The lifecycle the command channel reports. The ordering is meaningful and the
  * gap between ACCEPTED and APPLIED is where this domain hides its failures.
  *
- *   PENDING   queued by the platform; the device may not know yet
- *   ACCEPTED  the device acknowledged the instruction. NOT an actuation.
- *   REJECTED  refused. The one failure the channel can state outright.
- *   APPLIED   the device says it did the thing. Authoritative when offered —
- *             and many real platforms never offer it at all, which is exactly
- *             why the telemetry path below cannot be skipped.
+ *   PENDING      queued by the platform; the device may not know yet
+ *   ACCEPTED     the device acknowledged the instruction. NOT an actuation.
+ *   IN_PROGRESS  the device says it is working on it and expects to finish.
+ *   REJECTED     refused. The one failure the channel can state outright.
+ *   APPLIED      the device says it did the thing. Authoritative when offered —
+ *                and many real platforms never offer it at all, which is
+ *                exactly why the telemetry path below cannot be skipped.
+ *
+ * IN_PROGRESS is borrowed from Azure IoT Plug and Play, whose convention has a
+ * device write back a status code `ac` alongside the acknowledged version: 200
+ * for accepted, 400 or 500 for refused or failed, and 202 for an update still
+ * in progress that should later finish at 200. It is a real improvement on a
+ * binary ack, and not because it confirms anything — it does not. Its value is
+ * diagnostic. A command that times out having only ever been ACCEPTED and one
+ * that times out after the device said it was working on it are different
+ * faults with different owners, and a timeout that cannot tell them apart sends
+ * somebody to read the wrong logs.
+ *
+ * The same distinction exists at the protocol level in Z-Wave's Supervision
+ * command class, where a supervised SET is answered with a status saying whether
+ * the command was understood AND executed; zwave-js separates "never sent",
+ * "received but not executed" and "invalid value" for exactly this reason.
  */
-export type CommandReportState = 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'APPLIED';
+export type CommandReportState = 'PENDING' | 'ACCEPTED' | 'IN_PROGRESS' | 'REJECTED' | 'APPLIED';
 
 export type CommandReport = Readonly<{
   commandId: string;
@@ -209,9 +232,10 @@ export type Step = Readonly<{
   command: Command | null;
   why: string;
   /**
-   * WHICH CORRELATION BRANCH THIS DECISION TOOK, or null if it needed none.
+   * ADDED HERE. Which correlation branch this decision took, or null if it
+   * needed none.
    *
-   * THE ONE ADDITION TO THE PORTED CORE, and the reason this repository exists.
+   * The one addition to the ported core, and the reason this repository exists.
    * The sibling repo can argue in a README that correlation is tri-state and
    * that a generation echo beats a clock estimate. An operational system has to
    * be able to show how often each branch actually fires, or the argument stays
@@ -255,6 +279,19 @@ export type Input = Readonly<{
   /**
    * Identities for the next command, supplied by the shell so this function
    * stays pure and still gets to mint them.
+   *
+   * WHO SHOULD MINT THE GENERATION, which this shape deliberately leaves open.
+   * The counter belongs to whoever serialises commands to the device, and that
+   * is the PLATFORM, not a client. Kubernetes sets `metadata.generation` on the
+   * object, in the API server. Azure IoT Hub manages the desired section's
+   * `$version` and the device echoes it back as `av`. Both put the counter at
+   * the single point every writer passes through.
+   *
+   * This implementation mints it in the shell (`engine.ts`), which is correct
+   * only while there is exactly one reconciler per device. Two reconcilers each
+   * minting their own sequence produce counters that cannot be compared, and
+   * each would read the other's work as a third-party change. Against a real
+   * platform, take the counter from the platform and never invent one.
    */
   next: Readonly<{ commandId: string; generation: Generation }>;
 }>;
@@ -277,12 +314,12 @@ function watermark(obs: Observation, seen: DeviceInstant | null): DeviceInstant 
 }
 
 /*
- * The four constructors below leave `correlation` null and `reconcile` fills it
- * in from what was actually computed. Threading it through every call site
- * instead would mean touching all twenty-odd return statements in the decision
- * function to add a field that none of them decide — a change with real risk for
- * no benefit, on the one file in this repository that must not drift from the
- * sibling's logic.
+ * ADDED HERE. The four constructors below leave `correlation` null and
+ * `reconcile` fills it in from what was actually computed. Threading it through
+ * every call site instead would mean touching all twenty-odd return statements
+ * in the decision function to add a field that none of them decide — a change
+ * with real risk for no benefit, on the one file in this repository that must
+ * not drift from the sibling's logic.
  */
 const fail = (now: Instant, target: boolean, reason: FailReason, why: string): Step => ({
   state: { phase: 'FAILED', since: now, target, reason },
@@ -321,10 +358,11 @@ function reportFor(report: CommandReport | null, commandId: string): CommandRepo
 }
 
 /**
- * Records the correlation a decision performed, so `reconcile` can report it
- * without any call site having to carry it. A closure rather than a mutable
- * field on the input, so `reconcile` stays pure: the recorder is created per
- * call, never escapes, and the function is still a function of its arguments.
+ * ADDED HERE. Records the correlation a decision performed, so `reconcile` can
+ * report it without any call site having to carry it. A closure rather than a
+ * mutable field on the input, so `reconcile` stays pure: the recorder is created
+ * per call, never escapes, and the function is still a function of its
+ * arguments.
  */
 type Track = (r: CorrelationResult) => CorrelationResult;
 
@@ -431,17 +469,20 @@ function decide(input: Input, track: Track): Step {
       }
 
       if (now >= state.deadline) {
-        // An ack with no application is the headline trap: it looks like success
-        // and is not, so the message names it rather than saying "timeout".
-        const acked = mine?.state === 'ACCEPTED';
-        return fail(
-          now,
-          state.target,
-          'timeout-unconfirmed',
-          acked
-            ? 'acknowledged but never observed to take effect before the deadline'
-            : 'no confirmation from either channel before the deadline',
-        );
+        /*
+         * Three different faults, three different messages. "Timeout" alone
+         * sends an operator to the network; each of these points somewhere
+         * specific, and the command channel is the only thing that can tell
+         * them apart:
+         *
+         *   silence      the instruction may never have arrived. Look at
+         *                connectivity and at the platform's queue.
+         *   acknowledged it arrived and nothing happened. Look at the device.
+         *   in progress  the device said it was working and never finished.
+         *                Look at the device's own error state; it knows
+         *                something it has not told us.
+         */
+        return fail(now, state.target, 'timeout-unconfirmed', explainTimeout(mine?.state));
       }
 
       /*
@@ -517,12 +558,35 @@ function decide(input: Input, track: Track): Step {
         );
       }
 
+      /*
+       * WHO MOVED IT. A command advances the generation; a human at the panel
+       * does not. So a fresh reading that disagrees with intent while reporting
+       * the SAME generation we last converged at is positive evidence that
+       * somebody else changed the device — exact, same-channel, no clock
+       * involved. It is strictly better than inferring "drift" from the state
+       * alone, which cannot tell a third party apart from our own command
+       * finally landing.
+       *
+       * This only names the cause. Deciding what to do about it is a policy
+       * this module does not have: see the override note in the README. Fighting
+       * a human is right for a charger on a tariff and wrong for someone who
+       * just turned the heating up, and nothing in a state machine can tell you
+       * which. Naming it is the honest half that can be done here.
+       */
+      const thirdParty =
+        state.phase === 'CONVERGED' &&
+        state.generation !== null &&
+        obs.observedGeneration !== null &&
+        obs.observedGeneration === state.generation;
+
       return issue(
         input,
         intent.charging,
-        state.phase === 'CONVERGED'
-          ? 'device drifted away from a confirmed state; re-issuing'
-          : 'state differs from intent; converging',
+        thirdParty
+          ? `state changed while the device is still on generation ${state.generation}, so something other than us moved it; re-issuing intent`
+          : state.phase === 'CONVERGED'
+            ? 'device drifted away from a confirmed state; re-issuing'
+            : 'state differs from intent; converging',
       );
     }
 
@@ -575,6 +639,32 @@ function telemetryFreshness(
   ).correlation === 'after'
     ? 'fresh'
     : 'command channel confirmed us, and no snapshot is provably newer than that confirmation';
+}
+
+/**
+ * Names which of the three timeout faults this is. See the call site.
+ *
+ * Exported for its own unit test. Two of its arms are unreachable through
+ * `reconcile`, because APPLIED and REJECTED leave ISSUED the moment they are
+ * seen, and testing a total function directly is cheaper and clearer than
+ * contorting the state machine to reach them.
+ */
+export function explainTimeout(reported: CommandReportState | undefined): string {
+  switch (reported) {
+    case 'IN_PROGRESS':
+      return 'device reported it was working on the command and never finished before the deadline';
+    case 'ACCEPTED':
+      return 'acknowledged but never observed to take effect before the deadline';
+    case 'APPLIED':
+    case 'REJECTED':
+      // Unreachable: both are handled above and leave ISSUED immediately.
+      return 'reached the deadline despite a terminal report, which should not happen';
+    case 'PENDING':
+    case undefined:
+      return 'no confirmation from either channel before the deadline';
+    default:
+      return assertNever(reported, 'explainTimeout');
+  }
 }
 
 /**

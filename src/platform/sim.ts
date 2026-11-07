@@ -69,6 +69,14 @@ export type Profile = Readonly<{
   actuationDelayMs: number;
   /** Devices that echo the generation they applied. The exact-correlation path. */
   reportsGeneration: boolean;
+  /**
+   * Devices that answer a command with Azure's `ac: 202` — "in progress, will
+   * finish at 200" — before reporting APPLIED. It confirms NOTHING; its value is
+   * purely diagnostic, and that is the point of simulating it: a command that
+   * times out having only ever been ACCEPTED and one that times out after the
+   * device said it was working are different faults with different owners.
+   */
+  reportsInProgress: boolean;
   /** Refuses every command on the command channel. The one crisp failure. */
   rejectsCommands: boolean;
   /** Acknowledges and never actuates. The headline trap: looks like success. */
@@ -99,6 +107,7 @@ export function profileFor(deviceId: string, vendor: string, seed: number, tick:
     // makes the clock-fallback rate land somewhere interesting instead of at 0%
     // or 100%, where it would say nothing.
     reportsGeneration: chance(r, 0.5),
+    reportsInProgress: chance(r, 0.3),
     rejectsCommands: chance(r, 0.08),
     acksButNeverApplies: chance(r, 0.08),
     reportsApplied: chance(r, 0.4),
@@ -115,6 +124,24 @@ export type DeviceState = {
   plugged: boolean;
   /** The highest generation the device has actually applied, or null. */
   appliedGeneration: number | null;
+  /**
+   * THE PLATFORM'S OWN DESIRED-STATE VERSION, minted here and nowhere else.
+   *
+   * Azure IoT Hub manages `$version` on the desired section of a device twin and
+   * the device acknowledges by writing back `av` (acknowledgment version) with
+   * `ac` (a status code) and optionally `ad` (a description). Kubernetes does the
+   * same thing with `metadata.generation` set by the API server. Both put the
+   * counter at the single point every writer passes through, which is the only
+   * place it can be minted without two writers producing incomparable counters.
+   *
+   * So the platform mints it, per device, at the command endpoint — the
+   * serialisation point for this device's desired state. A client never invents
+   * one. See the note in src/platform/server.ts on why the client's own
+   * generation is round-tripped alongside it rather than replaced by it.
+   */
+  desiredVersion: number;
+  /** The `av` the device last acknowledged, echoed in telemetry. Diagnostic. */
+  acknowledgedVersion: number | null;
   /** An instruction accepted and not yet actuated. The gap this repo is about. */
   inFlight: { commandId: string; generation: number; target: boolean; actuateAt: number } | null;
   /** Next capture, on OUR clock; the snapshot it produces is stamped on the device's. */
@@ -127,6 +154,8 @@ export function initialState(profile: Profile, now: number): DeviceState {
     charging: false,
     plugged: !profile.startsUnplugged,
     appliedGeneration: null,
+    desiredVersion: 0,
+    acknowledgedVersion: null,
     inFlight: null,
     // Stagger the first capture across the interval so the whole fleet does not
     // report in lockstep — a synchronised fleet hides every ordering bug, and
@@ -150,17 +179,43 @@ export function powerState(d: DeviceState): PowerDeliveryState {
  * from slow until the deadline passes — the failure the sibling repository's
  * headline scenario is built around.
  */
+export type Acknowledgement = Readonly<{
+  state: CommandReportState;
+  /** Azure's `av`: the desired version this acknowledgement is about. */
+  av: number;
+  /** Azure's `ac`: 200 accepted, 202 in progress, 400/500 refused or failed. */
+  ac: number;
+  /** Azure's `ad`: free text for a human. Never parsed. */
+  ad: string;
+}>;
+
 export function accept(
   d: DeviceState,
   commandId: string,
   generation: number,
   target: boolean,
   now: number,
-): CommandReportState {
-  if (d.profile.rejectsCommands) return 'REJECTED';
-  if (d.profile.acksButNeverApplies) return 'ACCEPTED';
+): Acknowledgement {
+  // The version is minted HERE, on the way in, before any decision about whether
+  // the device will honour the instruction — exactly as Azure increments
+  // `$version` on a desired-section write regardless of what the device later
+  // does with it. A version that was only minted on success could not be used to
+  // talk about a rejection.
+  d.desiredVersion += 1;
+  const av = d.desiredVersion;
+
+  if (d.profile.rejectsCommands) {
+    return { state: 'REJECTED', av, ac: 400, ad: 'device refuses remote control of power delivery' };
+  }
+  if (d.profile.acksButNeverApplies) {
+    // The headline trap: the same 200 a healthy device returns, and then nothing
+    // ever happens. Indistinguishable from slow until the deadline passes.
+    return { state: 'ACCEPTED', av, ac: 200, ad: 'accepted' };
+  }
   d.inFlight = { commandId, generation, target, actuateAt: now + d.profile.actuationDelayMs };
-  return 'ACCEPTED';
+  return d.profile.reportsInProgress
+    ? { state: 'IN_PROGRESS', av, ac: 202, ad: 'switching power delivery' }
+    : { state: 'ACCEPTED', av, ac: 200, ad: 'accepted' };
 }
 
 /**
@@ -175,7 +230,15 @@ export type Capture = Readonly<{
   /** On OUR clock: when this snapshot should reach the reconciler. */
   deliverAt: number;
   powerDeliveryState: PowerDeliveryState;
+  /**
+   * The CLIENT's generation, round-tripped. This is what the reconciler
+   * correlates on, because it is the only counter in a namespace the reconciler
+   * can compare against its own phase. Null for the many devices that do not
+   * count, which selects the clock-bounds fallback.
+   */
   observedGeneration: number | null;
+  /** The PLATFORM's `av`. Diagnostic only; see the note in server.ts. */
+  acknowledgedVersion: number | null;
 }>;
 
 /** An actuation that completed, for the command channel to report as APPLIED. */
@@ -189,6 +252,7 @@ export function advance(d: DeviceState, now: number, r: Rng): { captures: Captur
     const { commandId, generation, target } = d.inFlight;
     d.charging = target && d.plugged;
     d.appliedGeneration = generation;
+    d.acknowledgedVersion = d.desiredVersion;
     d.inFlight = null;
     applied.push({ deviceId: d.profile.deviceId, commandId, generation });
   }
@@ -216,6 +280,7 @@ export function advance(d: DeviceState, now: number, r: Rng): { captures: Captur
       deliverAt,
       powerDeliveryState: powerState(d),
       observedGeneration: d.profile.reportsGeneration ? d.appliedGeneration : null,
+      acknowledgedVersion: d.acknowledgedVersion,
     });
   }
 

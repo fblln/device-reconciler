@@ -98,6 +98,33 @@ service must also scope them to its authenticated tenant and define a retention
 policy before exposing this local API publicly. Delivery retries still use the
 outbox command ID; user-action identity does not replace device-side deduplication.
 
+## One fleet, several platforms
+
+A reconciler that talks to more than one platform is holding more than one set
+of behaviours. A vendor whose devices echo a generation is confirmed by integer
+comparison, immediately. A vendor reached over Modbus and polled every five
+minutes cannot be confirmed until `maxLatency + skewBound` has passed and a
+capture has arrived after that. Fleet-wide numbers have to be sized for the
+worst vendor, so the fast one waits the slow one's timeout to learn that a
+command failed.
+
+`VENDOR_TIMING` overrides the three timing knobs per vendor, as JSON, merging
+over the fleet defaults:
+
+```json
+{ "acme": { "commandTimeout": 60000 }, "old-modbus": { "commandTimeout": 900000, "maxLatency": 420000 } }
+```
+
+An unconfigured vendor gets the fleet values, so adding a vendor never requires
+configuring one. Unknown keys and non-numbers are refused at startup rather
+than ignored. `clockConfirmationWindow` reports what is left of a timeout after
+the clock floor; a vendor that echoes a generation may legitimately run a
+negative window, because it never consults a clock.
+
+The evidence for setting these is already in `/readout.txt`, which tallies
+correlation outcomes per vendor: a vendor at a high clock-fallback rate needs
+room, and one at zero can have its deadline cut.
+
 ## How it works
 
 ### 1. Durable in-flight state

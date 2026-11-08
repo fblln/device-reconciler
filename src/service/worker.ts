@@ -39,7 +39,7 @@ import { movedByOther, resolve, type OverrideConfig } from '../core/override.ts'
 import { observedCharging } from '../core/reconcile.ts';
 import { mint } from '../core/identity.ts';
 import { nextWake, type ScheduleConfig } from '../core/schedule.ts';
-import type { Bounds } from '../core/clock.ts';
+import { timingFor, type VendorTiming } from '../config.ts';
 import type { Duration, Instant } from '../core/time.ts';
 import { tx, type Db } from '../store/db.ts';
 import { claim, persist } from '../store/devices.ts';
@@ -51,8 +51,7 @@ import { log, type Instruments } from '../telemetry.ts';
 
 export type WorkerConfig = Readonly<{
   override: OverrideConfig;
-  commandTimeout: Duration;
-  bounds: Bounds;
+  timing: VendorTiming;
   schedule: ScheduleConfig;
   batchSize: number;
   concurrency: number;
@@ -101,7 +100,10 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
       report: device.report,
       clock: device.clock,
       state: device.phase,
-      opts: { commandTimeout: cfg.commandTimeout, bounds: cfg.bounds },
+      // Per vendor, not per fleet: a platform that echoes a generation is
+      // confirmed exactly and deserves a short deadline, while one polled every
+      // few minutes needs a long one. See VendorTiming in config.ts.
+      opts: timingFor(cfg.timing, device.vendor),
       next: mint(device.deviceId, device.commandSeq, device.generation),
     });
 

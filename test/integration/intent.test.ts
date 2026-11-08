@@ -132,7 +132,7 @@ test('explicit retry creates a fresh command, and a stale worker cannot overwrit
       db,
       twin: noTwin,
       instruments: createInstruments(),
-      cfg: { ...cfg, bounds: { skewBound: cfg.skewBound, maxLatency: cfg.maxLatency } },
+      cfg: { ...cfg, timing: cfg.timing },
     };
     await db.query(`insert into observation values ('charger',true,1000,1000,'PLUGGED_IN:STOPPED',0)`);
     const first = await submitIntent(db, 'charger', 'one', { charging: true, source: 'operator' }, 1000);

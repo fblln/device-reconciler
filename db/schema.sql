@@ -246,3 +246,21 @@ create table if not exists decision (
 );
 
 create index if not exists decision_rollup on decision (vendor, phase, correlation, source);
+
+-- User actions are separate from delivery attempts. Keys are scoped to a device
+-- and retained durably: a lost HTTP response must not refresh override metadata.
+create table if not exists intent_operation (
+  operation_id uuid primary key,
+  device_id text not null references device(device_id),
+  charging boolean not null,
+  source text not null,
+  created_at bigint not null
+);
+alter table device add column if not exists active_operation_id uuid references intent_operation(operation_id);
+create table if not exists intent_request (
+  device_id text not null references device(device_id),
+  request_key text not null,
+  fingerprint text not null,
+  operation_id uuid not null references intent_operation(operation_id),
+  primary key (device_id, request_key)
+);

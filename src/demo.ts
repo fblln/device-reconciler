@@ -63,7 +63,7 @@ console.log(`fleet of ${fleet.length} across ${new Set(fleet.map((d) => d.vendor
 for (const device of fleet) {
   await fetch(`${base}/v1/devices/${encodeURIComponent(device.deviceId)}/intent`, {
     method: 'PUT',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() },
     body: JSON.stringify({ charging: true }),
   });
 }

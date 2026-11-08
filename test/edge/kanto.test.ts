@@ -39,7 +39,7 @@ async function device() {
 async function intent(charging: boolean) {
   const res = await fetch(`${api}/v1/devices/${encodeURIComponent(DEVICE)}/intent`, {
     method: 'PUT',
-    headers,
+    headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
     body: JSON.stringify({ charging }),
     signal: AbortSignal.timeout(5_000),
   });

@@ -25,6 +25,7 @@
 
 import { rows, type Queryable } from './db.ts';
 import type { CommandReportState, PowerDeliveryState } from '../core/reconcile.ts';
+import { sequenceOf } from '../core/identity.ts';
 import type { DeviceInstant, Instant } from '../core/time.ts';
 
 export async function recordTelemetry(
@@ -69,12 +70,17 @@ export async function recordReport(
   q: Queryable,
   report: Readonly<{ deviceId: string; commandId: string; state: CommandReportState; at: Instant }>,
 ): Promise<void> {
+  // -1 for an id we cannot read: it may still fill an empty row, and it can
+  // never evict a real one.
+  const sequence = sequenceOf(report.commandId) ?? -1;
   await q.query(
-    `insert into command_report (device_id, command_id, state, at)
-       values ($1, $2, $3, $4)
+    `insert into command_report (device_id, command_id, state, at, command_seq)
+       values ($1, $2, $3, $4, $5)
        on conflict (device_id) do update set
-         command_id = excluded.command_id, state = excluded.state, at = excluded.at`,
-    [report.deviceId, report.commandId, report.state, report.at],
+         command_id = excluded.command_id, state = excluded.state, at = excluded.at,
+         command_seq = excluded.command_seq
+       where (excluded.command_seq, excluded.at) >= (command_report.command_seq, command_report.at)`,
+    [report.deviceId, report.commandId, report.state, report.at, sequence],
   );
 }
 

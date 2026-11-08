@@ -10,7 +10,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deviceOf, mint } from '../../src/core/identity.ts';
+import { deviceOf, mint, sequenceOf } from '../../src/core/identity.ts';
 import { generation } from '../../src/core/correlate.ts';
 
 test('minting is deterministic in the device, the sequence and the last generation', () => {
@@ -42,4 +42,30 @@ test('a command id with no sequence is treated as the whole device id', () => {
   // minting above, and attributing it to a device that exists beats throwing
   // inside webhook ingest.
   assert.equal(deviceOf('dev-1'), 'dev-1');
+});
+
+/**
+ * A command id is the only sound way to ORDER two reports from the command
+ * channel, so an id we cannot read must be able to order nothing at all.
+ */
+test('a command id yields its device and its sequence, or nothing it could mis-order by', () => {
+  const id = mint('dev-7', 41, generation(3)).commandId;
+  assert.equal(id, 'dev-7/42');
+  assert.equal(sequenceOf(id), 42);
+  assert.equal(sequenceOf('dev-7/0'), 0);
+  // A device id containing a slash still resolves against the LAST one.
+  assert.equal(sequenceOf('site-a/dev-7/42'), 42);
+  assert.equal(deviceOf('site-a/dev-7/42'), 'site-a/dev-7');
+  for (const bad of [
+    'dev-7',
+    'dev-7/',
+    'dev-7/ 2',
+    'dev-7/2.5',
+    'dev-7/1e3',
+    'dev-7/0x2',
+    'dev-7/-1',
+    'dev-7/9007199254740993',
+  ]) {
+    assert.equal(sequenceOf(bad), null, bad);
+  }
 });

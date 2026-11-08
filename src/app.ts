@@ -28,6 +28,7 @@
  * caught.
  */
 
+import { handleIntent, operation, IntentError } from './service/intent.ts';
 import { randomUUID } from 'node:crypto';
 import { createEdgeAdapter } from './edge/adapter.ts';
 import { loadConfig } from './config.ts';
@@ -39,7 +40,7 @@ import { createGate } from './adapter/gate.ts';
 import { createTwinStore, defaultDittoTimeout } from './twin/ditto.ts';
 import { createProjector, noTwin } from './twin/project.ts';
 import { connect, migrate } from './store/db.ts';
-import { setIntent, viewRows } from './store/devices.ts';
+import { viewRows } from './store/devices.ts';
 import { describe, present } from './core/presentation.ts';
 import { reconcileBatch } from './service/worker.ts';
 import { dispatchBatch } from './service/dispatcher.ts';
@@ -47,7 +48,7 @@ import { handleWebhook } from './service/ingest.ts';
 import { markQuiet, syncFleet } from './service/sweep.ts';
 import { buildReport, renderReport } from './service/report.ts';
 import { createInstruments, log, startTelemetry } from './telemetry.ts';
-import { readBody, sendJson, sendText, serve, urlOf } from './http.ts';
+import { sendJson, sendText, serve, urlOf } from './http.ts';
 
 const cfg = loadConfig();
 const now = (): Instant => instant(Date.now());
@@ -211,17 +212,18 @@ const server = serve(cfg.port, async (req, res) => {
   if (url.pathname === '/readout') return sendJson(res, 200, await buildReport(db, gate));
   if (url.pathname === '/readout.txt') return sendText(res, 200, renderReport(await buildReport(db, gate)));
 
-  const intent = /^\/v1\/devices\/([^/]+)\/intent$/.exec(url.pathname);
-  if (intent !== null && req.method === 'PUT') {
-    const body = JSON.parse(await readBody(req)) as { charging: boolean; source?: string };
-    // Everything arriving through our API is an 'operator' intent: explicit,
-    // attributable and recent, which is what gives it precedence over a local
-    // change for as long as it stays fresh. A scheduler writing a tariff plan
-    // would pass 'schedule' and correctly lose to somebody at the device.
-    const source = body.source === 'schedule' ? 'schedule' : 'operator';
-    const deviceId = decodeURIComponent(intent[1]!);
-    await setIntent(db, deviceId, body.charging === true, source, now());
-    return sendJson(res, 200, { deviceId, charging: body.charging === true, source });
+  const status = /^\/v1\/devices\/([^/]+)\/operations\/([^/]+)$/.exec(url.pathname);
+  if (status && req.method === 'GET') {
+    try {
+      return sendJson(res, 200, await operation(db, decodeURIComponent(status[1]!), status[2]!));
+    } catch (error) {
+      if (error instanceof IntentError) return sendJson(res, error.status, { error: error.message });
+      throw error;
+    }
+  }
+  const intent = /^\/v1\/devices\/([^/]+)\/intent(\/retry)?$/.exec(url.pathname);
+  if (intent && req.method === (intent[2] ? 'POST' : 'PUT')) {
+    return handleIntent(req, res, db, decodeURIComponent(intent[1]!), Boolean(intent[2]), now());
   }
 
   return sendText(res, 404, 'not found');

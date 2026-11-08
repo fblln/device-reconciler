@@ -120,7 +120,7 @@ async function wantCharging(port: number, db: Db): Promise<string[]> {
   for (const { device_id: deviceId } of devices) {
     const res = await fetch(`http://127.0.0.1:${port}/v1/devices/${deviceId}/intent`, {
       method: 'PUT',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() },
       body: JSON.stringify({ charging: true, source: 'operator' }),
     });
     assert.equal(res.status, 200, `setting intent on ${deviceId}`);

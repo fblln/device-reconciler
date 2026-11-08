@@ -58,6 +58,7 @@ export type DeviceWork = Readonly<{
   generation: Generation;
   /** Monotonic per-device counter behind the command id. */
   commandSeq: number;
+  activeOperationId: string | null;
   obs: Observation;
   report: CommandReport | null;
 }>;
@@ -73,6 +74,7 @@ type Row = {
   clock: unknown;
   generation: string;
   command_seq: string;
+  active_operation_id: string | null;
   is_reachable: boolean | null;
   device_time: string | null;
   received_at: string | null;
@@ -192,7 +194,7 @@ export async function claim(
        returning d.*
      )
      select l.device_id, l.vendor, l.intent_charging, l.intent_source, l.intent_set_at,
-            l.local_change_at, l.phase, l.clock, l.generation, l.command_seq,
+            l.active_operation_id, l.local_change_at, l.phase, l.clock, l.generation, l.command_seq,
             o.is_reachable, o.device_time, o.received_at, o.power_delivery_state, o.observed_generation,
             r.command_id as report_command_id, r.state as report_state, r.at as report_at
        from leased l
@@ -214,6 +216,7 @@ export async function claim(
     clock: parseClock(row.clock, row.device_id),
     generation: asGeneration(Number(row.generation)),
     commandSeq: Number(row.command_seq),
+    activeOperationId: row.active_operation_id,
     obs: observationFrom(row, now),
     report: reportFrom(row),
   }));
@@ -371,7 +374,7 @@ export async function viewRows(q: Queryable, now: Instant): Promise<DeviceViewRo
   const result = await rows<Row & { optimistic: boolean; last_why: string | null }>(
     q,
     `select d.device_id, d.vendor, d.intent_charging, d.intent_source, d.intent_set_at,
-            d.local_change_at, d.phase, d.clock, d.generation, d.command_seq,
+            d.active_operation_id, d.local_change_at, d.phase, d.clock, d.generation, d.command_seq,
             d.optimistic, d.last_why,
             o.is_reachable, o.device_time, o.received_at, o.power_delivery_state, o.observed_generation,
             r.command_id as report_command_id, r.state as report_state, r.at as report_at

@@ -105,7 +105,14 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
       next: mint(device.deviceId, device.commandSeq, device.generation),
     });
 
-    await tx(db, async (client) => {
+    const committed = await tx(db, async (client) => {
+      // A user action may have changed after claim. Fence stale decisions before
+      // either the phase or its outbox command can overwrite that newer action.
+      const current = await client.query(
+        'select active_operation_id from device where device_id=$1 for update',
+        [device.deviceId],
+      );
+      if (current.rows[0]?.active_operation_id !== device.activeOperationId) return false;
       await persist(client, device.deviceId, {
         phase: step.state,
         clock: device.clock,
@@ -139,7 +146,9 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
         now,
         resolution.outcome === 'assert' ? step : { ...step, why: `${resolution.why}; ${step.why}` },
       );
+      return true;
     });
+    if (!committed) return;
 
     instruments.decisions.add(1, {
       phase: step.state.phase,

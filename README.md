@@ -67,6 +67,37 @@ is a legitimate outcome that must be waited out rather than guessed past. Where 
 device echoes back which instruction it last applied, the question collapses to
 integer comparison and no clock is involved at all. That is always preferred.
 
+## Submitting intent safely
+
+`PUT /v1/devices/:id/intent` requires an `Idempotency-Key` header and a JSON
+body such as `{"charging":true,"source":"operator"}`. Generate a key once per
+user action and reuse it after a timeout or missing response. The response
+contains `operationId`, `status`, `phase`, and a `statusUrl` (also in `Location`).
+`ACCEPTED` means stored for evaluation, not applied by the device. Poll the
+status URL for current progress, including the command deadline once issued.
+
+The database records the key and intent in one transaction. Reusing a key with
+a different payload returns 409. Concurrent requests with the same key return
+the same operation. A different key with the same target and source also joins
+the current operation, preserving its deadline and override metadata. This
+includes failed operations: repeatedly pressing Start does not silently retry a
+failure. A superseded operation remains identifiable and reports `SUPERSEDED`;
+replaying it never restores its old intent.
+
+To deliberately retry, send `POST /v1/devices/:id/intent/retry` with a new
+`Idempotency-Key` and `{"retryOf":"<failed-operation-id>"}`. Only the current
+failed operation is eligible. Repeating this request returns the same new
+operation; a stale or nonfailed operation returns 409. Existing command counters
+and clock evidence survive the retry.
+
+Clients should immediately show receipt, display pending confirmation separately
+from success, and reuse the action key while waiting. There is no control UI in
+this repository: these are API guarantees, not a claim that buttons are disabled.
+Keys are scoped to a device and retained without automatic expiry. A multi-tenant
+service must also scope them to its authenticated tenant and define a retention
+policy before exposing this local API publicly. Delivery retries still use the
+outbox command ID; user-action identity does not replace device-side deduplication.
+
 ## How it works
 
 ### 1. Durable in-flight state

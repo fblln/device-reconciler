@@ -19,6 +19,7 @@
  */
 
 import { duration, type Duration } from './core/time.ts';
+import type { Bounds } from './core/clock.ts';
 import type { BackoffConfig } from './core/backoff.ts';
 import type { BreakerConfig } from './core/breaker.ts';
 import type { Limits } from './core/ratelimit.ts';
@@ -37,6 +38,96 @@ const num = (name: string, fallback: number): number => {
   return n;
 };
 const ms = (name: string, fallback: number): Duration => duration(num(name, fallback));
+const json = (name: string): Record<string, unknown> => {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${name} must be JSON, got ${JSON.stringify(raw)}`);
+  }
+  // Same refusal as `num`: a tuning value that silently reverts to the default
+  // is a configuration change that looks applied and is not.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+    throw new Error(`${name} must be a JSON object of vendor names`);
+  return parsed as Record<string, unknown>;
+};
+
+/**
+ * The three numbers that decide whether a command is judged confirmed, failed
+ * or still undecided. Grouped because they are only meaningful together: see
+ * `clockConfirmationWindow` for the arithmetic that ties them.
+ */
+export type Timing = Readonly<{ commandTimeout: Duration; bounds: Bounds }>;
+
+/**
+ * PER VENDOR, BECAUSE A FLEET IS NOT UNIFORM.
+ *
+ * These numbers describe how a platform behaves, and a reconciler that talks to
+ * several platforms is holding several different behaviours at once. A vendor
+ * whose devices echo a generation is confirmed exactly and instantly; a vendor
+ * reached over Modbus and polled every five minutes cannot be confirmed before
+ * `maxLatency + skewBound` has passed and then a capture has arrived. One set
+ * of numbers for both means sizing for the worst vendor, which taxes every
+ * other one: the fast vendor waits the slow vendor's timeout to learn that a
+ * command failed.
+ *
+ * The shape mirrors `gate.ts`, which already keeps a limiter and a breaker per
+ * vendor for the same reason, and `readout.ts`, which already tallies
+ * correlation outcomes per vendor because "a fleet average hides the one vendor
+ * that is the problem". This closes the gap between those two and the numbers
+ * that actually decide a command's fate.
+ *
+ * An absent vendor gets the fleet defaults, so adding a vendor never requires
+ * configuring one. ponytail: one JSON env var, not a config file format.
+ */
+export type VendorTiming = Readonly<{
+  fleet: Timing;
+  byVendor: Readonly<Record<string, Timing>>;
+}>;
+
+/** The numbers that apply to this vendor. Unconfigured vendors get the fleet's. */
+export const timingFor = (timing: VendorTiming, vendor: string): Timing =>
+  timing.byVendor[vendor] ?? timing.fleet;
+
+/**
+ * Reads `VENDOR_TIMING`, a JSON object of vendor name to partial overrides:
+ *
+ *   {"acme":{"commandTimeout":60000},"old-modbus":{"commandTimeout":900000,"maxLatency":420000}}
+ *
+ * Each entry merges over the fleet values, so a vendor states only what differs
+ * from the default. Unknown keys and non-numbers are refused rather than
+ * ignored, for the reason given on `num`: a typo that silently keeps the
+ * default is a change that looks applied and is not.
+ */
+function vendorTiming(fleet: Timing): VendorTiming {
+  const byVendor: Record<string, Timing> = {};
+  for (const [vendor, raw] of Object.entries(json('VENDOR_TIMING'))) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      throw new Error(`VENDOR_TIMING.${vendor} must be an object`);
+    const over = raw as Record<string, unknown>;
+    const pick = (key: 'commandTimeout' | 'skewBound' | 'maxLatency', fallback: Duration): Duration => {
+      const value = over[key];
+      if (value === undefined) return fallback;
+      if (typeof value !== 'number' || !Number.isFinite(value))
+        throw new Error(`VENDOR_TIMING.${vendor}.${key} must be a number`);
+      return duration(value);
+    };
+    for (const key of Object.keys(over)) {
+      if (!['commandTimeout', 'skewBound', 'maxLatency'].includes(key))
+        throw new Error(`VENDOR_TIMING.${vendor} has unknown key ${JSON.stringify(key)}`);
+    }
+    byVendor[vendor] = {
+      commandTimeout: pick('commandTimeout', fleet.commandTimeout),
+      bounds: {
+        skewBound: pick('skewBound', fleet.bounds.skewBound),
+        maxLatency: pick('maxLatency', fleet.bounds.maxLatency),
+      },
+    };
+  }
+  return { fleet, byVendor };
+}
 
 export type Config = Readonly<{
   databaseUrl: string;
@@ -51,9 +142,7 @@ export type Config = Readonly<{
   dittoUrl: string;
   dittoNamespace: string;
   dittoSubject: string;
-  commandTimeout: Duration;
-  skewBound: Duration;
-  maxLatency: Duration;
+  timing: VendorTiming;
   schedule: ScheduleConfig;
   override: OverrideConfig;
   backoff: BackoffConfig;
@@ -116,10 +205,11 @@ export function loadConfig(): Config {
     // At a 180s timeout that left a ~30s window for a snapshot to both be
     // captured and arrive, so a fleet whose capture interval is a minute would
     // fail commands it had actually applied. See `clockConfirmationWindow`.
-    commandTimeout: ms('COMMAND_TIMEOUT_MS', 300_000),
     // The declared bounds. See the header.
-    skewBound: ms('SKEW_BOUND_MS', 30_000),
-    maxLatency: ms('MAX_LATENCY_MS', 120_000),
+    timing: vendorTiming({
+      commandTimeout: ms('COMMAND_TIMEOUT_MS', 300_000),
+      bounds: { skewBound: ms('SKEW_BOUND_MS', 30_000), maxLatency: ms('MAX_LATENCY_MS', 120_000) },
+    }),
 
     schedule: {
       sweepInterval: ms('SWEEP_INTERVAL_MS', 30_000),
@@ -160,7 +250,7 @@ export function loadConfig(): Config {
 /**
  * How long a clock-only device has to produce a confirming capture.
  *
- * WHY THIS IS A FUNCTION AND NOT A COMMENT. The three knobs above are tuned
+ * WHY THIS IS A FUNCTION AND NOT A COMMENT. The three knobs are tuned
  * independently by whoever knows the fleet, and the failure when they
  * contradict each other is silent and expensive: commands that worked are
  * reported as failures, and the reason string blames the clock bounds rather
@@ -177,11 +267,12 @@ export function loadConfig(): Config {
  * The bar is higher than positive. `staleAfter` already declares how long a
  * feed may be silent and still count as healthy, so the window must be at
  * least that long or devices the sweep considers fine will fail commands they
- * applied. test/unit/config.test.ts holds the two together.
+ * applied. test/unit/config.test.ts holds the two together, for the fleet
+ * defaults AND for every configured vendor — a per-vendor override is exactly
+ * where this relationship is easiest to break by hand.
  *
  * Devices that DO echo a generation are unaffected: `byGeneration` is integer
  * comparison and never consults a clock.
  */
-export const clockConfirmationWindow = (
-  cfg: Pick<Config, 'commandTimeout' | 'maxLatency' | 'skewBound'>,
-): Duration => duration(cfg.commandTimeout - cfg.maxLatency - cfg.skewBound);
+export const clockConfirmationWindow = (timing: Timing): Duration =>
+  duration(timing.commandTimeout - timing.bounds.maxLatency - timing.bounds.skewBound);

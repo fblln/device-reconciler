@@ -107,8 +107,7 @@ const worker = {
   twin,
   cfg: {
     override: cfg.override,
-    commandTimeout: cfg.commandTimeout,
-    bounds: { skewBound: cfg.skewBound, maxLatency: cfg.maxLatency },
+    timing: cfg.timing,
     schedule: cfg.schedule,
     batchSize: cfg.batchSize,
     concurrency: cfg.concurrency,

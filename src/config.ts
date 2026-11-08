@@ -108,7 +108,15 @@ export function loadConfig(): Config {
     // A promise to a user, not a technical constant: it must exceed the worst
     // realistic telemetry interval by a comfortable margin, or confirmations
     // that were genuinely on their way get reported as failures.
-    commandTimeout: ms('COMMAND_TIMEOUT_MS', 180_000),
+    //
+    // FIVE MINUTES, NOT THREE, and the extra two are arithmetic rather than
+    // taste. A device that echoes no generation can only be confirmed by
+    // `capturedAfter`, which cannot return 'after' until a capture is at least
+    // `maxLatency + skewBound` past the command — 150s at the defaults below.
+    // At a 180s timeout that left a ~30s window for a snapshot to both be
+    // captured and arrive, so a fleet whose capture interval is a minute would
+    // fail commands it had actually applied. See `clockConfirmationWindow`.
+    commandTimeout: ms('COMMAND_TIMEOUT_MS', 300_000),
     // The declared bounds. See the header.
     skewBound: ms('SKEW_BOUND_MS', 30_000),
     maxLatency: ms('MAX_LATENCY_MS', 120_000),
@@ -148,3 +156,32 @@ export function loadConfig(): Config {
     seed: num('SEED', 20261107),
   };
 }
+
+/**
+ * How long a clock-only device has to produce a confirming capture.
+ *
+ * WHY THIS IS A FUNCTION AND NOT A COMMENT. The three knobs above are tuned
+ * independently by whoever knows the fleet, and the failure when they
+ * contradict each other is silent and expensive: commands that worked are
+ * reported as failures, and the reason string blames the clock bounds rather
+ * than the timeout that was too short to use them.
+ *
+ * `capturedAfter` needs `maxLatency + skewBound` of device-clock distance
+ * before it can prove a capture post-dates the command (see the derivation in
+ * clock.ts — the minimum sample bounds the offset from ABOVE only, so proving
+ * 'after' costs an upper bound on latency). Whatever is left of the timeout
+ * after that floor is the entire window in which a snapshot must be both
+ * captured and delivered. Non-positive means a device that echoes no
+ * generation can never be confirmed by telemetry and will always time out.
+ *
+ * The bar is higher than positive. `staleAfter` already declares how long a
+ * feed may be silent and still count as healthy, so the window must be at
+ * least that long or devices the sweep considers fine will fail commands they
+ * applied. test/unit/config.test.ts holds the two together.
+ *
+ * Devices that DO echo a generation are unaffected: `byGeneration` is integer
+ * comparison and never consults a clock.
+ */
+export const clockConfirmationWindow = (
+  cfg: Pick<Config, 'commandTimeout' | 'maxLatency' | 'skewBound'>,
+): Duration => duration(cfg.commandTimeout - cfg.maxLatency - cfg.skewBound);

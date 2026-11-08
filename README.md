@@ -4,32 +4,40 @@ A desired-state reconciler for energy devices — EV chargers, inverters, batter
 heat pumps — reached through an **aggregator platform** that exposes two separate
 channels with two separate clocks.
 
-This is the **operational** half. Its sibling, [`device-reconciler`](../device-reconciler),
-is the **logical** half: a pure, dependency-free simulation that works out what it
-even means to know whether a command took effect. That repository's README names
-its own deliberate gaps, and this one is those gaps, taken seriously:
+The reconciler tracks what was requested, what the device reported, and whether
+that report is evidence that the request took effect. It preserves uncertainty
+when the two clocks cannot be compared reliably, and keeps commands, deadlines
+and recovery state durable across process restarts.
 
-|              | `device-reconciler`                   | `device-reconciler`                                                                 |
-| ------------ | ------------------------------------- | ----------------------------------------------------------------------------------- |
-| the problem  | can I tell whether my command worked? | can I run that answer for a fleet, forever, through a restart?                      |
-| state        | in memory                             | Postgres: phase, clock model, generation, durable timer                             |
-| the twin     | a variable                            | **Eclipse Ditto**: desired and reported state, persisted and queryable              |
-| dispatch     | a function call                       | outbox → HTTP, idempotency-keyed, at-least-once                                     |
-| the platform | an in-process simulator               | **a runnable HTTP service** in this repo: OAuth2, pagination, 429s, signed webhooks |
-| the edge     | —                                     | **Eclipse Kanto**, opt-in: a real on-device twin (see below)                        |
-| failure      | a scenario                            | per-vendor rate limits, circuit breakers, jittered backoff, bounded concurrency     |
-| evidence     | ten golden timelines                  | OpenTelemetry metrics, a readout endpoint, and the twin itself                      |
-| dependencies | none                                  | `pg`, OpenTelemetry. No cloud, no AWS, no broker.                                   |
+## What it does
 
-The argument behind both lives in **“Two Channels, Two Clocks”**, at
-`/articles/two-channels-two-clocks/` on fblln.github.io — written but not yet
-deployed, so that path is not linked here; this repository's rule is that a URL
-is either resolved or not cited. Its companion,
-[“The Health Check Was a Reverse Shell”](https://fblln.github.io/articles/the-health-check-was-a-reverse-shell/),
-is live and governs every readiness probe in this repo.
+- **Decides from evidence:** prefers a device's applied-generation counter, then
+  uses declared clock and latency bounds to classify telemetry as before, after,
+  or not yet distinguishable from a command.
+- **Runs a durable control loop:** PostgreSQL stores phases, generations, clock
+  estimates, deadlines, inbox deduplication and an idempotent command outbox.
+- **Handles fleet failures:** per-vendor rate limits, circuit breakers, bounded
+  concurrency and jittered backoff contain slow or failing upstream services.
+- **Respects override policy:** schedules, local changes and operator intent have
+  explicit precedence, with hold and conflict outcomes.
+- **Publishes state:** Eclipse Ditto exposes desired and reported properties;
+  the HTTP view model exposes confidence, confirmation deadlines and faults.
+- **Exercises real transport:** the optional Eclipse Kanto → Hono → Ditto stack
+  connects a local device twin through separate telemetry and command paths.
+- **Makes failures reproducible:** a seeded mock aggregator injects delay,
+  reordering, duplicates, rejection and acknowledgements without actuation.
 
-Read the article for the reasoning; the sibling repo for the pure logic; this
-one for what it costs to operate.
+## Why it exists
+
+A platform accepting a command does not prove that a device applied it. Delayed
+telemetry can describe the state before the command, and comparing timestamps
+from independent clocks can produce a false confirmation. This project makes
+those distinctions explicit and keeps them intact through retries and restarts.
+
+The design is explained in
+[“Two Channels, Two Clocks”](https://fblln.github.io/articles/two-channels-two-clocks/).
+For the readiness probes, see
+[“The Health Check Was a Reverse Shell”](https://fblln.github.io/articles/the-health-check-was-a-reverse-shell/).
 
 ---
 
@@ -59,14 +67,13 @@ is a legitimate outcome that must be waited out rather than guessed past. Where 
 device echoes back which instruction it last applied, the question collapses to
 integer comparison and no clock is involved at all. That is always preferred.
 
-## What this repository adds
+## How it works
 
 ### 1. Durable in-flight state
 
 The phase holds a command id, a generation, a deadline and a device-clock
-watermark. In the sibling repo a restart loses all of it and the loop re-issues a
-command that is already outstanding — the exact failure the design exists to
-prevent. Here:
+watermark. Persisting them prevents a restart from forgetting an outstanding
+command and issuing it again:
 
 - **phase, clock model and generation counter live in Postgres** (`db/schema.sql`),
   written in one transaction with the intent to send.
@@ -159,9 +166,8 @@ worth knowing; only the first is what this number is.
   generation echo. This is the cost of the fleet's hardware in one number, and the
   procurement argument for devices that count.
 
-`reconcile()` carries the branch it took (`Step.correlation`) — the one addition
-to the ported core, and the reason this repository exists: the sibling can _argue_
-that correlation is tri-state; a running system has to be able to _show it_.
+`reconcile()` records the branch it took in `Step.correlation`, so the readout
+can show how each decision was reached and how often evidence remained unknown.
 
 Timeouts are reported as three distinct faults with three distinct owners, from
 Azure's `ac` status: **silence** (the instruction may never have arrived — look at
@@ -175,14 +181,13 @@ that cannot tell them apart sends somebody to read the wrong logs.
 A command advances the generation; a human at the panel does not. So a fresh
 reading that disagrees with intent while still reporting the generation we
 converged at is _exact_ evidence that somebody else moved the device — same
-channel, same counter, no clock. The sibling repo identifies that and stops,
-deliberately: what to do about it is a policy, and fighting a human is right for
-a charger on a tariff and wrong for someone who just turned the heating up.
+channel, same counter, no clock. The response is a policy decision: a tariff
+schedule and a person changing the heating can require different precedence.
 
 Retrofitting a policy onto a loop that re-asserts unconditionally is painful, so
 intent here has a **source** and a **precedence** from the start
 (`src/core/override.ts`), resolved _upstream_ of the decision function so the
-ported core needs no change:
+decision function remains focused on evidence:
 
 - `schedule` — a tariff window or optimiser. Standing instruction, nobody watching.
 - `local` — inferred from a third-party change. Never written by us.
@@ -217,19 +222,17 @@ dev-0001 badger    CONVERGED  charging     [confirmed-estimated, toggle]
 dev-0005 tortoise  CONVERGED  not charging [confirmed-exact, toggle]
 ```
 
-Two departures from Home Assistant, and both are earned rather than clever:
+The view model has two independent controls:
 
-- **`assumed` is derived, not declared.** The loop already knows whether
-  anything from a device has ever been placeable in time, and a computed flag
-  cannot drift out of date the way a hand-written one does. This is also where
-  durability pays off twice: the clock model it reads is a **column**, so a
-  restart does not re-report a perfectly correlatable device as `assumed` until
-  the next telemetry sample lands. In the sibling repo, on a two-minute feed,
-  that is minutes of showing buttons instead of a toggle after every deploy.
-- **`optimistic` stays configuration, per device.** Nothing derives it: it is a
-  judgement about which lie is worse. Showing “charging” a little early on a
-  charger is kind; showing “heating” to somebody who is cold is how people stop
-  trusting an app. A fleet is mixed, so it is a column rather than a setting.
+- **`assumed` is computed from available evidence.** It is true when there is
+  neither an observed generation nor a clock sample. The UI uses separate
+  buttons when assumed and a toggle otherwise. This is a proxy: the current
+  implementation does not persist whether a reading has ever been successfully
+  correlated with a command. A clock sample can still leave correlation unknown.
+- **`optimistic` is configuration, per device.** It determines whether the UI
+  displays the requested state while confirmation is pending. Display policy
+  never changes what the reconciler considers confirmed. Timeout and clock
+  bounds are configured separately.
 
 And because the loop holds a **deadline**, the view can say
 `confirming start (143s left)` instead of a spinner with no end, and name which
@@ -397,15 +400,13 @@ demand, and all of it is the pathology matrix the tests are worth running for.
 `SEED` makes every one of those reproducible, which is what lets an agent replay
 an interesting failure instead of waiting for it.
 
-So: a deterministic simulator for the matrix, and real software pointed at once
-to show the integration is not fiction. The sibling repository documents the
-same split for the same reason.
+The seeded fleet covers the failure matrix; the Kanto/Hono integration tests
+exercise the real transport and local twin synchronization.
 
 ## Prior art
 
-Every URL below was resolved before it was committed. Nothing here is cited from
-memory — two citations in an earlier draft of the sibling repo turned out to be
-dead links written from recall, which is the reason for the rule.
+The following references explain the protocols and reliability patterns used
+in this implementation.
 
 This is not a novel problem, and the industry has converged on **order by a
 counter, not by a clock**:
@@ -503,7 +504,7 @@ On ordering events across clocks you do not control:
   watermark keeps "is anything new?" an exact same-clock comparison, so the lossy
   cross-clock estimate is needed in exactly one place.
 
-And for the operational half, which is what this repository adds:
+The durable execution layer uses these patterns:
 
 - **Transactional outbox** — [the pattern](https://microservices.io/patterns/data/transactional-outbox.html),
   for the reason in `db/schema.sql`: deciding and sending cannot be made atomic,
@@ -532,16 +533,12 @@ And for the operational half, which is what this repository adds:
 
 ## Who mints the counter
 
-Worth stating plainly, because the sibling repo leaves it open and gets it
-half-wrong.
-
 The counter must be minted at the **single serialisation point for a device's
 desired state**. Kubernetes sets `metadata.generation` in the API server; Azure
 IoT Hub manages `$version` in the hub. Two writers each minting their own
 sequence produce counters that cannot be compared, and each reads the other's
-work as a third-party change. The sibling repo mints it in its process, which is
-sound only while exactly one reconciler exists — and a counter that lives in a
-process is a counter that restarts.
+work as a third-party change. The counter therefore belongs in durable storage
+with a single serialization point per device.
 
 This repository has two serialisation points and uses both, for different jobs:
 
@@ -578,11 +575,9 @@ often the fallback was needed anyway.
 | `test/core/`        | unit, contract and property tests on a virtual clock                                                                     | the only code under the 100% gate                                                                                                 |
 | `test/integration/` | Testcontainers Postgres, the platform in process, a live Ditto                                                           | SQL cannot be tested against a fake of my beliefs about SQL                                                                       |
 
-`src/core/time.ts`, `clock.ts`, `correlate.ts`, `reconcile.ts` and `contracts.ts`
-are **ported verbatim** from the sibling repo (plus `Step.correlation`), with a
-banner at the top of each saying why they are vendored rather than depended on:
-publishing a package from a repository whose whole claim is "no dependencies"
-would destroy the property it exists to demonstrate.
+`src/core/` contains the time model, correlation rules and reconciliation state
+machine. It has no I/O; callers supply time and observations, making the same
+rules usable in deterministic tests and the running service.
 
 ## Running it
 
@@ -748,7 +743,7 @@ checks find things, so here is the ledger from this pass:
   random left it green, because after a `SIGKILL` the restarted process
   re-drives the outbox **row**, which already holds the id, so the idempotency
   key never has to do anything. The restart test proves durability — persisting
-  `initialPhase` instead of the real phase, exactly the sibling's in-memory gap,
+  `initialPhase` instead of the real phase,
   fails it immediately — but not idempotency. That now has its own test, which
   the mutation kills.
 

@@ -25,8 +25,8 @@
  */
 
 import type { Correlation, CorrelationSource } from '../core/correlate.ts';
-import type { PhaseName, Step } from '../core/reconcile.ts';
-import type { DecisionRow } from '../core/readout.ts';
+import type { FailReason, PhaseName, Step } from '../core/reconcile.ts';
+import type { DecisionRow, OutcomeRow } from '../core/readout.ts';
 import type { Instant } from '../core/time.ts';
 import { rows, type Queryable } from './db.ts';
 
@@ -36,10 +36,12 @@ export async function record(
   vendor: string,
   at: Instant,
   step: Step,
+  /** The phase this decision moved away from. See `outcomes` for why. */
+  prev: PhaseName,
 ): Promise<void> {
   await q.query(
-    `insert into decision (device_id, vendor, at, phase, correlation, source, reason)
-       values ($1, $2, $3, $4, $5, $6, $7)`,
+    `insert into decision (device_id, vendor, at, phase, correlation, source, reason, prev_phase, fail_reason)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [
       deviceId,
       vendor,
@@ -48,8 +50,45 @@ export async function record(
       step.correlation?.correlation ?? null,
       step.correlation?.source ?? null,
       step.why,
+      prev,
+      step.state.phase === 'FAILED' ? step.state.reason : null,
     ],
   );
+}
+
+/**
+ * Phase transitions per device, which is what a reliability question is made
+ * of. Only rows where the phase actually changed: a hold is the loop working
+ * correctly and counting it would drown the signal in ticks.
+ *
+ * Superseded commands are deliberately absent. An intent change mid-flight
+ * leaves ISSUED for ISSUED, which is not a transition here, and that is honest:
+ * a command replaced before it could be judged never got a verdict and should
+ * not be counted as one either way.
+ */
+export async function outcomes(q: Queryable): Promise<OutcomeRow[]> {
+  const result = await rows<{
+    device_id: string;
+    vendor: string;
+    prev_phase: string;
+    phase: string;
+    fail_reason: string | null;
+    n: string;
+  }>(
+    q,
+    `select device_id, vendor, prev_phase, phase, fail_reason, count(*)::text as n
+       from decision
+      where prev_phase is not null and prev_phase is distinct from phase
+      group by 1, 2, 3, 4, 5`,
+  );
+  return result.map((r) => ({
+    deviceId: r.device_id,
+    vendor: r.vendor,
+    prevPhase: r.prev_phase as PhaseName,
+    phase: r.phase as PhaseName,
+    failReason: r.fail_reason as FailReason | null,
+    count: Number(r.n),
+  }));
 }
 
 export async function rollup(q: Queryable): Promise<DecisionRow[]> {

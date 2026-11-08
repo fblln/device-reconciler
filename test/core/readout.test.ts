@@ -9,7 +9,15 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { render, summarise, type DecisionRow } from '../../src/core/readout.ts';
+import {
+  deviceReliability,
+  render,
+  renderDevices,
+  summarise,
+  type DecisionRow,
+  type OutcomeRow,
+} from '../../src/core/readout.ts';
+import type { FailReason, PhaseName } from '../../src/core/reconcile.ts';
 
 const row = (over: Partial<DecisionRow> = {}): DecisionRow => ({
   vendor: 'acme',
@@ -112,4 +120,97 @@ test('the rendered readout names the fallback rate, so an operator can see the e
 test('an empty readout renders without an n/a that pretends to be a number', () => {
   const text = render(summarise([]));
   assert.match(text, /n\/a/);
+});
+
+/**
+ * Reliability counters. The transitions are what a command's verdict looks
+ * like in the log, so the arithmetic that turns them into a rate is the part
+ * that can be quietly wrong.
+ */
+const outcome = (
+  deviceId: string,
+  prevPhase: PhaseName,
+  phase: PhaseName,
+  count: number,
+  failReason: FailReason | null = null,
+): OutcomeRow => ({ deviceId, vendor: 'hare', prevPhase, phase, failReason, count });
+
+test('a device is measured by its verdicts, and the faults stay apart', () => {
+  const health = deviceReliability([
+    outcome('a', 'ISSUED', 'CONVERGED', 7),
+    outcome('a', 'ISSUED', 'FAILED', 2, 'timeout-unconfirmed'),
+    outcome('a', 'ISSUED', 'FAILED', 1, 'rejected-by-vendor'),
+    outcome('a', 'CONVERGED', 'ISSUED', 4),
+    outcome('a', 'CONVERGED', 'SUSPENDED', 3),
+    // A hold that the store filters out, included here to prove the pure
+    // function does not depend on that filter to stay correct.
+    outcome('a', 'ISSUED', 'ISSUED', 99),
+  ]);
+  assert.deepEqual(health['a'], {
+    vendor: 'hare',
+    commands: 10,
+    confirmed: 7,
+    rejected: 1,
+    unconfirmed: 2,
+    drifted: 4,
+    wentDark: 3,
+    confirmationRate: 0.7,
+  });
+});
+
+test('a device with no verdict yet has no rate, and does not read as perfect', () => {
+  const health = deviceReliability([outcome('b', 'IDLE', 'SUSPENDED', 2)]);
+  assert.equal(health['b']?.confirmationRate, null);
+  assert.equal(health['b']?.commands, 0);
+  assert.equal(health['b']?.wentDark, 2);
+  assert.deepEqual(deviceReliability([]), {});
+});
+
+test('the device table ranks the worst first and keeps the unjudged out of the way', () => {
+  const health = deviceReliability([
+    outcome('good', 'ISSUED', 'CONVERGED', 10),
+    outcome('bad', 'ISSUED', 'CONVERGED', 1),
+    outcome('bad', 'ISSUED', 'FAILED', 9, 'timeout-unconfirmed'),
+    outcome('quiet', 'IDLE', 'SUSPENDED', 1),
+    outcome('untouched', 'ISSUED', 'ISSUED', 5),
+  ]);
+  const lines = renderDevices(health).split('\n').slice(1);
+  assert.deepEqual(
+    lines.map((l) => l.split(' ')[0]),
+    ['bad', 'good', 'quiet'],
+    'worst rate first; a device with no verdict sorts last; one with no transitions is absent',
+  );
+  assert.match(renderDevices({}), /no verdicts yet/);
+  assert.equal(renderDevices(health, 1).split('\n').length, 2, 'the limit caps the table');
+  // Fixed-width columns, and a device with no verdict renders a shorter rate
+  // than a percentage, so the table is where that difference shows up.
+  const widths = new Set(
+    renderDevices(health)
+      .split('\n')
+      .map((l) => l.length),
+  );
+  assert.equal(widths.size, 1, 'every row lines up with the header');
+});
+
+test('a device earns a row on drift alone, and equal rates break by name', () => {
+  const health = deviceReliability([
+    // No command has ever been judged here, but something keeps moving it.
+    outcome('drifter', 'CONVERGED', 'ISSUED', 3),
+    // Recovery out of SUSPENDED is a transition that is none of these outcomes
+    // and must leave every counter alone.
+    outcome('drifter', 'SUSPENDED', 'IDLE', 5),
+    outcome('zulu', 'ISSUED', 'CONVERGED', 1),
+    outcome('alpha', 'ISSUED', 'CONVERGED', 2),
+  ]);
+  assert.equal(health['drifter']?.commands, 0);
+  assert.equal(health['drifter']?.drifted, 3);
+  assert.equal(health['drifter']?.wentDark, 0, 'leaving SUSPENDED is not going dark');
+  assert.deepEqual(
+    renderDevices(health)
+      .split('\n')
+      .slice(1)
+      .map((l) => l.split(' ')[0]),
+    ['alpha', 'zulu', 'drifter'],
+    'both confirmed devices sit at 100%, so the tiebreak is the name',
+  );
 });

@@ -125,6 +125,37 @@ The evidence for setting these is already in `/readout.txt`, which tallies
 correlation outcomes per vendor: a vendor at a high clock-fallback rate needs
 room, and one at zero can have its deadline cut.
 
+## Measuring a device, not scoring it
+
+`/readout.txt` ends with a per-device table, worst first:
+
+```
+device          vendor      cmds   confirmed   rejected   unconfirmed   drift   dark
+dev-0012        tortoise      39       20.5%          0            31       0     17
+dev-0007        hare          25       80.0%          5             0       0      0
+dev-0000        hare         145       97.9%          0             3       0      0
+dev-0031        tortoise       0         n/a          0             0       9      0
+```
+
+The counters stay apart on purpose, because they have different owners. A
+`rejected` is the vendor answering no, which is the only crisp failure this
+system can observe. An `unconfirmed` is nobody answering before the deadline,
+which on a clock-only device may say more about the telemetry interval than
+about the hardware (see `clockConfirmationWindow`). `drift` is somebody at the
+device disagreeing with us, detected exactly when the device echoes the
+generation we last converged at. `dark` is the feed. A single weighted score
+would rank the fleet in one column and destroy the only thing the ranking is
+for, which is knowing who to call.
+
+`cmds` counts commands that reached a verdict. A command superseded mid-flight
+is deliberately absent: it never got one, and counting it either way would be a
+claim the system cannot support. A device with no verdict yet shows `n/a` and
+sorts last, since an absence of evidence is not a good score.
+
+The numbers come from phase transitions in the `decision` log, not from phase
+counts. A decision is written on every wake, so a device sitting in ISSUED for
+ten wakes writes ten rows; only a change of phase is a verdict.
+
 ## How it works
 
 ### 1. Durable in-flight state

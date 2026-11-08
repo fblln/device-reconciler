@@ -37,7 +37,7 @@
  */
 
 import type { Correlation, CorrelationSource } from './correlate.ts';
-import type { PhaseName } from './reconcile.ts';
+import type { FailReason, PhaseName } from './reconcile.ts';
 
 /**
  * One decision, as persisted. `correlation` and `source` are null when the
@@ -58,6 +58,90 @@ export type DecisionRow = Readonly<{
   source: CorrelationSource | null;
   count: number;
 }>;
+
+/**
+ * One phase transition, grouped. See `outcomes` in src/store/decisions.ts for
+ * why transitions and not phases.
+ */
+export type OutcomeRow = Readonly<{
+  deviceId: string;
+  vendor: string;
+  prevPhase: PhaseName;
+  phase: PhaseName;
+  failReason: FailReason | null;
+  count: number;
+}>;
+
+/**
+ * How a single device has behaved, as counters rather than as a score.
+ *
+ * WHY NOT ONE NUMBER. A weighted composite would rank the fleet in one column
+ * and destroy the only thing the ranking is for: knowing who to call. These
+ * four outcomes have four different owners. A rejection is the vendor
+ * answering; a timeout is nobody answering; drift is somebody at the device
+ * disagreeing with us; a dark feed is the network. Averaging them produces a
+ * number that moves for reasons you cannot act on, which is how reliability
+ * dashboards end up being watched by nobody.
+ *
+ * `confirmationRate` is the one rate here, and it is deliberately narrow: the
+ * share of commands that reached a verdict AND that verdict was confirmation.
+ * It is not a success rate for the hardware. A `timeout-unconfirmed` means the
+ * loop could not prove the command landed, which on a clock-only device may say
+ * more about the telemetry interval than about the charger (see
+ * `clockConfirmationWindow`), and the two columns sit next to each other so
+ * that reading is available rather than hidden inside an average.
+ */
+export type DeviceHealth = Readonly<{
+  vendor: string;
+  /** Commands that reached a verdict. Superseded commands are not counted. */
+  commands: number;
+  confirmed: number;
+  /** The vendor said no. A real answer, and the only crisp failure available. */
+  rejected: number;
+  /** Nobody said anything before the deadline. */
+  unconfirmed: number;
+  /** Converged, then moved without us. Somebody else is driving this device. */
+  drifted: number;
+  /** Times the telemetry feed went dark under it. */
+  wentDark: number;
+  /** confirmed / commands, or null when this device has had no verdict yet. */
+  confirmationRate: number | null;
+}>;
+
+const emptyHealth = (vendor: string): DeviceHealth => ({
+  vendor,
+  commands: 0,
+  confirmed: 0,
+  rejected: 0,
+  unconfirmed: 0,
+  drifted: 0,
+  wentDark: 0,
+  confirmationRate: null,
+});
+
+/** Per-device counters, from the grouped transitions. Pure, so the arithmetic is testable. */
+export function deviceReliability(rows: readonly OutcomeRow[]): Record<string, DeviceHealth> {
+  const out = new Map<string, { -readonly [K in keyof DeviceHealth]: DeviceHealth[K] }>();
+  for (const row of rows) {
+    const d = out.get(row.deviceId) ?? { ...emptyHealth(row.vendor) };
+    out.set(row.deviceId, d);
+    if (row.prevPhase === 'ISSUED' && row.phase === 'CONVERGED') {
+      d.commands += row.count;
+      d.confirmed += row.count;
+    } else if (row.prevPhase === 'ISSUED' && row.phase === 'FAILED') {
+      d.commands += row.count;
+      if (row.failReason === 'rejected-by-vendor') d.rejected += row.count;
+      else d.unconfirmed += row.count;
+    } else if (row.prevPhase === 'CONVERGED' && row.phase === 'ISSUED') {
+      d.drifted += row.count;
+    } else if (row.phase === 'SUSPENDED') {
+      d.wentDark += row.count;
+    }
+  }
+  return Object.fromEntries(
+    [...out].map(([id, d]) => [id, { ...d, confirmationRate: ratio(d.confirmed, d.commands) }]),
+  );
+}
 
 export type Rates = Readonly<{
   /** Correlations attempted. The denominator for both rates below. */
@@ -151,6 +235,45 @@ const pct = (r: number | null): string => (r === null ? '  n/a' : `${(r * 100).t
  * human or an agent with no browser. The same numbers are exported as
  * OpenTelemetry metrics; this is the view that needs no collector running.
  */
+/**
+ * The least reliable devices first, which is the only order this table is read
+ * in. A device with no verdict yet sorts last rather than best: a null rate is
+ * an absence of evidence, and putting it at the top of a "worst first" list
+ * would send somebody to look at a device nothing has been asked of.
+ */
+/*
+ * One row builder for the header and the data, so the columns cannot drift
+ * apart. They did while this was two format strings: `pct` returns five
+ * characters for null and six for a number, which is invisible until one
+ * device has no verdict and everything below it steps left by one.
+ */
+const deviceRow = (c: readonly string[]): string =>
+  `${c[0]!.padEnd(15)} ${c[1]!.padEnd(10)} ${c[2]!.padStart(5)}   ${c[3]!.padStart(9)}   ` +
+  `${c[4]!.padStart(8)}   ${c[5]!.padStart(11)}   ${c[6]!.padStart(5)}   ${c[7]!.padStart(4)}`;
+
+export function renderDevices(health: Record<string, DeviceHealth>, limit = 10): string {
+  const ranked = Object.entries(health)
+    .filter(([, d]) => d.commands > 0 || d.drifted > 0 || d.wentDark > 0)
+    .toSorted(([a, x], [b, y]) => (x.confirmationRate ?? 2) - (y.confirmationRate ?? 2) || a.localeCompare(b))
+    .slice(0, limit);
+  if (ranked.length === 0) return 'devices        (no verdicts yet)';
+  return [
+    deviceRow(['device', 'vendor', 'cmds', 'confirmed', 'rejected', 'unconfirmed', 'drift', 'dark']),
+    ...ranked.map(([id, d]) =>
+      deviceRow([
+        id,
+        d.vendor,
+        String(d.commands),
+        pct(d.confirmationRate),
+        String(d.rejected),
+        String(d.unconfirmed),
+        String(d.drifted),
+        String(d.wentDark),
+      ]),
+    ),
+  ].join('\n');
+}
+
 export function render(r: Readout): string {
   const lines: string[] = [];
   lines.push(

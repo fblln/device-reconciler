@@ -147,6 +147,7 @@ export async function reconcileBatch(deps: WorkerDeps, now: Instant): Promise<nu
         device.vendor,
         now,
         resolution.outcome === 'assert' ? step : { ...step, why: `${resolution.why}; ${step.why}` },
+        device.phase.phase,
       );
       return true;
     });

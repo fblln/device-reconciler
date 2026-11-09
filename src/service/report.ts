@@ -16,9 +16,16 @@
  *               every device sits in FAILED is a fleet that is not working.
  */
 
-import { render, summarise, type Readout } from '../core/readout.ts';
+import {
+  deviceReliability,
+  render,
+  renderDevices,
+  summarise,
+  type DeviceHealth,
+  type Readout,
+} from '../core/readout.ts';
 import type { Db } from '../store/db.ts';
-import { rollup } from '../store/decisions.ts';
+import { outcomes, rollup } from '../store/decisions.ts';
 import { countAccepted } from '../store/inbox.ts';
 import { stats as outboxStats, type OutboxStats } from '../store/outbox.ts';
 import { countByPhase } from '../store/devices.ts';
@@ -29,6 +36,8 @@ export type FullReport = Readonly<{
   outbox: OutboxStats;
   eventsAccepted: number;
   devicesByPhase: Record<string, number>;
+  /** Per-device counters, worst first when rendered. See core/readout.ts. */
+  reliability: Record<string, DeviceHealth>;
   vendors: ReturnType<Gate['snapshot']>;
 }>;
 
@@ -36,17 +45,19 @@ export async function buildReport(db: Db, gate: Gate): Promise<FullReport> {
   // Independent reads, so they go out together: a readout that takes five
   // sequential round trips is a readout nobody scrapes often enough to notice a
   // problem with.
-  const [decisions, outbox, eventsAccepted, devicesByPhase] = await Promise.all([
+  const [decisions, outbox, eventsAccepted, devicesByPhase, transitions] = await Promise.all([
     rollup(db),
     outboxStats(db),
     countAccepted(db),
     countByPhase(db),
+    outcomes(db),
   ]);
   return {
     correlation: summarise(decisions),
     outbox,
     eventsAccepted,
     devicesByPhase,
+    reliability: deviceReliability(transitions),
     vendors: gate.snapshot(),
   };
 }
@@ -67,5 +78,7 @@ export function renderReport(r: FullReport): string {
     `outbox         pending ${r.outbox.pending}  dispatched ${r.outbox.dispatched}  abandoned ${r.outbox.abandoned}`,
     `events         ${r.eventsAccepted} accepted (duplicates rejected by the inbox unique index)`,
     `vendors        ${vendors || '(no traffic yet)'}`,
+    '',
+    renderDevices(r.reliability),
   ].join('\n');
 }

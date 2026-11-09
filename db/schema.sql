@@ -254,6 +254,16 @@ create index if not exists decision_rollup on decision (vendor, phase, correlati
 -- free to acknowledge an old command late, which makes its stamp look newest.
 alter table command_report add column if not exists command_seq bigint not null default 0;
 
+-- A decision is logged on every wake, so counting rows by phase counts TICKS,
+-- not commands: a device sitting in ISSUED for ten wakes writes ten rows. The
+-- previous phase makes transitions countable, and a transition out of ISSUED
+-- happens exactly once per command that reached a verdict. fail_reason is kept
+-- as its own column rather than parsed back out of the reason sentence, because
+-- a refusal and a silence are different faults with different owners.
+alter table decision add column if not exists prev_phase text;
+alter table decision add column if not exists fail_reason text;
+create index if not exists decision_outcomes on decision (device_id, prev_phase, phase);
+
 -- User actions are separate from delivery attempts. Keys are scoped to a device
 -- and retained durably: a lost HTTP response must not refresh override metadata.
 create table if not exists intent_operation (

@@ -247,6 +247,13 @@ create table if not exists decision (
 
 create index if not exists decision_rollup on decision (vendor, phase, correlation, source);
 
+-- The command channel can deliver a report for a superseded command after the
+-- report for the one that replaced it. One row per device plus an unconditional
+-- upsert meant the stale arrival evicted the fresh one, and the confirmation was
+-- lost. Ordering is by our own command sequence, never by `at`: a platform is
+-- free to acknowledge an old command late, which makes its stamp look newest.
+alter table command_report add column if not exists command_seq bigint not null default 0;
+
 -- User actions are separate from delivery attempts. Keys are scoped to a device
 -- and retained durably: a lost HTTP response must not refresh override metadata.
 create table if not exists intent_operation (

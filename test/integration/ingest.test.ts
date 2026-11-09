@@ -82,6 +82,15 @@ async function startIngest(db: Db): Promise<Ingest> {
   };
 }
 
+const commandReport = (deviceId: string, eventId: string, commandId: string, state: string, at: number) => ({
+  eventId,
+  kind: 'report' as const,
+  deviceId,
+  commandId,
+  state,
+  at,
+});
+
 const telemetry = (deviceId: string, eventId: string) => ({
   eventId,
   kind: 'telemetry' as const,
@@ -231,4 +240,45 @@ test('telemetry pulls the device forward instead of waiting for the sweep', asyn
     5_000,
   );
   assert.ok(Number(woken[0]!.wake_at) < far);
+});
+
+test('a late report for a superseded command cannot evict the current one', async (t) => {
+  const stack = await startStack({ fleetSize: 1 });
+  const ingest = await startIngest(stack.db);
+  t.after(async () => {
+    await ingest.stop();
+    await stack.stop();
+  });
+  await register(stack.db, 'dev-0000', 'hare', initialPhase(instant(0)), unknownClock, instant(0));
+
+  const held = async () =>
+    (
+      await rows<{ command_id: string; state: string }>(
+        stack.db,
+        'select command_id, state from command_report where device_id = $1',
+        ['dev-0000'],
+      )
+    )[0];
+
+  // The device's second command is acknowledged and applied.
+  await ingest.post(commandReport('dev-0000', randomUUID(), 'dev-0000/2', 'APPLIED', 2_000));
+  assert.deepEqual(await held(), { command_id: 'dev-0000/2', state: 'APPLIED' });
+
+  /*
+   * Now the first command's acknowledgement finally turns up, and the platform
+   * stamps it LATER than the one it supersedes. That is the case `at` cannot
+   * order: by timestamp this stale report looks like the freshest thing we
+   * hold. Only our own sequence says otherwise.
+   */
+  const late = await ingest.post(commandReport('dev-0000', randomUUID(), 'dev-0000/1', 'ACCEPTED', 3_000));
+  assert.deepEqual(late, { status: 200, body: { accepted: true } });
+  assert.deepEqual(
+    await held(),
+    { command_id: 'dev-0000/2', state: 'APPLIED' },
+    'the confirmation for the current command must survive a late report for a superseded one',
+  );
+
+  // A report that genuinely advances the current command still lands.
+  await ingest.post(commandReport('dev-0000', randomUUID(), 'dev-0000/3', 'REJECTED', 2_500));
+  assert.deepEqual(await held(), { command_id: 'dev-0000/3', state: 'REJECTED' });
 });

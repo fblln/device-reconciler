@@ -47,6 +47,27 @@ export function mint(deviceId: string, commandSeq: number, lastGeneration: Gener
   return { commandId: `${deviceId}/${commandSeq + 1}`, generation: nextGeneration(lastGeneration) };
 }
 
+/**
+ * The per-device sequence inside a command id, or null if it does not carry one.
+ *
+ * This exists because command ids are the only sound way to ORDER two reports
+ * from the command channel. Their `at` stamps are on our clock and look
+ * orderable, but a platform can acknowledge a superseded command after it has
+ * acknowledged the one that replaced it, so `at` says the stale report is the
+ * newer one. The sequence cannot: it is our own counter, advanced once per
+ * minted command and never reused.
+ */
+export function sequenceOf(commandId: string): number | null {
+  const slash = commandId.lastIndexOf('/');
+  if (slash === -1) return null;
+  const tail = commandId.slice(slash + 1);
+  // Reject anything Number() would be generous about: '', ' 2', '2.5', '1e3',
+  // '0x2'. A command id we cannot read must not be able to order anything.
+  if (!/^\d+$/.test(tail)) return null;
+  const n = Number(tail);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 /** The device a command id belongs to, for logs and for the demo's readout. */
 export function deviceOf(commandId: string): string {
   const slash = commandId.lastIndexOf('/');
